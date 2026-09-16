@@ -57,6 +57,8 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define Power_5V_EN_Pin GPIO_PIN_15
+#define Power_5V_EN_GPIO_Port GPIOC
 #define ACC_CS_Pin GPIO_PIN_0
 #define ACC_CS_GPIO_Port GPIOC
 #define GYRO_CS_Pin GPIO_PIN_3
@@ -65,8 +67,6 @@ void Error_Handler(void);
 #define ACC_INT_GPIO_Port GPIOE
 #define GYRO_INT_Pin GPIO_PIN_12
 #define GYRO_INT_GPIO_Port GPIOE
-#define Power_5V_EN_Pin GPIO_PIN_15
-#define Power_5V_EN_GPIO_Port GPIOD
 
 /* USER CODE BEGIN Private defines */
 

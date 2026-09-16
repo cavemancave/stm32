@@ -26,6 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "BMI088driver.h"
+#include "ws2812.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -36,6 +37,18 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/* 板载 WS2812 指示灯亮度(0-255)：满亮度很刺眼，这里用中等亮度 */
+#define LED_BRIGHTNESS            64U
+
+/* 使能可控 5V 之后，等 5V 轨稳定再和 BMI088 通信。
+   BMI088 数据手册要求 VDD 有效后加速度计 ~1ms、陀螺仪 ~30ms 才能访问，
+   5V 轨上的滤波电容充电还需要更多时间，这里统一留 100ms。 */
+#define POWER_5V_RAMP_UP_MS       100U
+
+/* BMI088 初始化失败后的重试间隔，以及最多向串口报告多少次错误码 */
+#define BMI088_INIT_RETRY_MS      200U
+#define BMI088_INIT_LOG_ATTEMPTS  10U
 
 /* USER CODE END PD */
 
@@ -114,22 +127,56 @@ int main(void)
   MX_DMA_Init();
   MX_UART7_Init();
   MX_SPI2_Init();
+  MX_SPI6_Init();
   /* USER CODE BEGIN 2 */
 
   static const uint8_t bmi_header[] = "gyro_x_rad_s,gyro_y_rad_s,gyro_z_rad_s,accel_x_g,accel_y_g,accel_z_g,temp_c\r\n";
   char bmi_uart_buffer[128];
   char bmi_value_buffer[7][16];
+  char bmi_error_buffer[64];
   int bmi_uart_length;
+
+  /* 使能可控 5V：板载 WS2812 和 BMI088 都由这一路供电，上电默认是关的 */
+  HAL_GPIO_WritePin(Power_5V_EN_GPIO_Port, Power_5V_EN_Pin, GPIO_PIN_SET);
+
+  /* 等 5V 轨爬升稳定后再和传感器通信 */
+  HAL_Delay(POWER_5V_RAMP_UP_MS);
+
+  /* 5V 有了再发一帧全灭：MCU 单独复位时灯珠会保留上一次的颜色 */
+  WS2812_Ctrl(0U, 0U, 0U);
 
   if (HAL_UART_Transmit(&huart7, (uint8_t *)bmi_header, sizeof(bmi_header) - 1U, HAL_MAX_DELAY) != HAL_OK)
   {
     Error_Handler();
   }
 
-  while(BMI088_init())
+  /* 等待 BMI088 就绪：红灯 = 还没成功(会一直重试)，绿灯 = 初始化成功 */
+  uint8_t bmi_error;
+  uint32_t bmi_attempt = 0U;
+
+  while ((bmi_error = BMI088_init()) != BMI088_NO_ERROR)
   {
-      ;
+    WS2812_Ctrl(LED_BRIGHTNESS, 0U, 0U);
+
+    /* 只报告前几次，避免传感器一直没响应时刷屏 */
+    if (bmi_attempt < BMI088_INIT_LOG_ATTEMPTS)
+    {
+      int bmi_error_length = snprintf(bmi_error_buffer, sizeof(bmi_error_buffer),
+                                      "BMI088 init failed, error=0x%02X, attempt=%lu\r\n",
+                                      (unsigned int)bmi_error, (unsigned long)(bmi_attempt + 1U));
+
+      if (bmi_error_length > 0 && bmi_error_length < (int)sizeof(bmi_error_buffer))
+      {
+        (void)HAL_UART_Transmit(&huart7, (uint8_t *)bmi_error_buffer,
+                                (uint16_t)bmi_error_length, HAL_MAX_DELAY);
+      }
+    }
+
+    bmi_attempt++;
+    HAL_Delay(BMI088_INIT_RETRY_MS);
   }
+
+  WS2812_Ctrl(0U, LED_BRIGHTNESS, 0U);
   /* USER CODE END 2 */
 
   /* Infinite loop */

@@ -64,6 +64,7 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # Kept in a separate file that STM32CubeMX does not generate/overwrite, so the
 # driver configuration survives every "Generate Code" run.
 include(cmake/bmi088.cmake)
+include(cmake/ws2812.cmake)
 
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
