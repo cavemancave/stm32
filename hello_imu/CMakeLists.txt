@@ -60,6 +60,11 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 # Remove wrong libob.a library dependency when using cpp files
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 
+# User defined libraries.
+# Kept in a separate file that STM32CubeMX does not generate/overwrite, so the
+# driver configuration survives every "Generate Code" run.
+include(cmake/bmi088.cmake)
+
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
