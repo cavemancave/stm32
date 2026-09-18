@@ -96,6 +96,10 @@ extern uint8_t bmi088_gyro_init(void);
 
 extern void BMI088_read(float gyro[3], float accel[3], float *temperate);
 
+/* 读传感器原始值(LBS；温度是未换算的 11bit 原始值，需自行 * BMI088_TEMP_FACTOR + BMI088_TEMP_OFFSET)。
+   上位机 https://imu.steppeschool.com/ 要求的就是原始 LSB，用它就不用先把数据转成 rad/s / g 再转回去。 */
+extern void BMI088_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temperate);
+
 
 
 #endif

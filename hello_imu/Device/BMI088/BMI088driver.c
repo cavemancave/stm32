@@ -276,37 +276,31 @@ uint8_t bmi088_gyro_init(void)
 }
 /**
 ************************************************************************
-* @brief:      	BMI088_read(float gyro[3], float accel[3], float *temperate)
-* @param:       gyro - 陀螺仪数据数组 (x, y, z)
-* @param:       accel - 加速度计数据数组 (x, y, z)
-* @param:       temperate - 温度数据指针
+* @brief:      	BMI088_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temperate)
+* @param:       accel - 加速度计原始数据数组 (x, y, z)，单位 LSB
+* @param:       gyro - 陀螺仪原始数据数组 (x, y, z)，单位 LSB
+* @param:       temperate - 温度原始数据指针，未换算(见头文件说明)
 * @retval:     	void
-* @details:    	读取BMI088传感器数据，包括加速度、陀螺仪和温度
+* @details:    	读取BMI088的寄存器原始值，不做任何量程换算，直接发给上位机用
 ************************************************************************
 **/
-void BMI088_read(float gyro[3], float accel[3], float *temperate)
+void BMI088_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temperate)
 {
     uint8_t buf[8] = {0, 0, 0, 0, 0, 0};
     int16_t bmi088_raw_temp;
 
     BMI088_accel_read_muli_reg(BMI088_ACCEL_XOUT_L, buf, 6);
 
-    bmi088_raw_temp = (int16_t)((buf[1]) << 8) | buf[0];
-    accel[0] = bmi088_raw_temp * BMI088_ACCEL_SEN;
-    bmi088_raw_temp = (int16_t)((buf[3]) << 8) | buf[2];
-    accel[1] = bmi088_raw_temp * BMI088_ACCEL_SEN;
-    bmi088_raw_temp = (int16_t)((buf[5]) << 8) | buf[4];
-    accel[2] = bmi088_raw_temp * BMI088_ACCEL_SEN;
+    accel[0] = (int16_t)((buf[1]) << 8) | buf[0];
+    accel[1] = (int16_t)((buf[3]) << 8) | buf[2];
+    accel[2] = (int16_t)((buf[5]) << 8) | buf[4];
 
     BMI088_gyro_read_muli_reg(BMI088_GYRO_CHIP_ID, buf, 8);
     if(buf[0] == BMI088_GYRO_CHIP_ID_VALUE)
     {
-        bmi088_raw_temp = (int16_t)((buf[3]) << 8) | buf[2];
-        gyro[0] = bmi088_raw_temp * BMI088_GYRO_SEN;
-        bmi088_raw_temp = (int16_t)((buf[5]) << 8) | buf[4];
-        gyro[1] = bmi088_raw_temp * BMI088_GYRO_SEN;
-        bmi088_raw_temp = (int16_t)((buf[7]) << 8) | buf[6];
-        gyro[2] = bmi088_raw_temp * BMI088_GYRO_SEN;
+        gyro[0] = (int16_t)((buf[3]) << 8) | buf[2];
+        gyro[1] = (int16_t)((buf[5]) << 8) | buf[4];
+        gyro[2] = (int16_t)((buf[7]) << 8) | buf[6];
     }
     BMI088_accel_read_muli_reg(BMI088_TEMP_M, buf, 2);
 
@@ -317,7 +311,35 @@ void BMI088_read(float gyro[3], float accel[3], float *temperate)
         bmi088_raw_temp -= 2048;
     }
 
-    *temperate = bmi088_raw_temp * BMI088_TEMP_FACTOR + BMI088_TEMP_OFFSET;
+    *temperate = bmi088_raw_temp;
+}
+
+/**
+************************************************************************
+* @brief:      	BMI088_read(float gyro[3], float accel[3], float *temperate)
+* @param:       gyro - 陀螺仪数据数组 (x, y, z)，单位 rad/s
+* @param:       accel - 加速度计数据数组 (x, y, z)，单位 g
+* @param:       temperate - 温度数据指针，单位 ℃
+* @retval:     	void
+* @details:    	读取BMI088传感器数据，包括加速度、陀螺仪和温度
+************************************************************************
+**/
+void BMI088_read(float gyro[3], float accel[3], float *temperate)
+{
+    int16_t raw_accel[3] = {0, 0, 0};
+    int16_t raw_gyro[3] = {0, 0, 0};
+    int16_t raw_temperate = 0;
+
+    BMI088_read_raw(raw_accel, raw_gyro, &raw_temperate);
+
+    accel[0] = raw_accel[0] * BMI088_ACCEL_SEN;
+    accel[1] = raw_accel[1] * BMI088_ACCEL_SEN;
+    accel[2] = raw_accel[2] * BMI088_ACCEL_SEN;
+    gyro[0] = raw_gyro[0] * BMI088_GYRO_SEN;
+    gyro[1] = raw_gyro[1] * BMI088_GYRO_SEN;
+    gyro[2] = raw_gyro[2] * BMI088_GYRO_SEN;
+
+    *temperate = raw_temperate * BMI088_TEMP_FACTOR + BMI088_TEMP_OFFSET;
 }
 
 #if defined(BMI088_USE_SPI)

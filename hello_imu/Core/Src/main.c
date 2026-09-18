@@ -50,6 +50,14 @@
 #define BMI088_INIT_RETRY_MS      200U
 #define BMI088_INIT_LOG_ATTEMPTS  10U
 
+/* 上位机(https://imu.steppeschool.com/)要求的是二进制包，固定 20 字节：
+   2 字节同步头 0xAA 0xFF，后面 9 个 int16(小端)——
+   加速度 xyz、陀螺 xyz、磁力 xyz。本板没有磁力计，磁力 3 轴固定填 0。
+   同步头之前的字节(比如下面的初始化错误文本)上位机会直接丢掉，不用特意清空。 */
+#define BMI088_PACKET_SYNC1       0xAAU
+#define BMI088_PACKET_SYNC2       0xFFU
+#define BMI088_PACKET_SIZE        20U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -67,28 +75,18 @@
 void SystemClock_Config(void);
 static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
-static int format_sensor_value(char *buffer, size_t buffer_size, float value);
+static void packet_put_int16(uint8_t *dst, int16_t value);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-float gyro[3], accel[3], temp;
+int16_t gyro_raw[3], accel_raw[3], temp_raw;
 
-static int format_sensor_value(char *buffer, size_t buffer_size, float value)
+static void packet_put_int16(uint8_t *dst, int16_t value)
 {
-  int32_t scaled_value = (int32_t)(value * 1000.0f);
-  int32_t magnitude = scaled_value;
-  int32_t fraction;
-
-  if (magnitude < 0)
-  {
-    magnitude = -magnitude;
-  }
-  fraction = magnitude % 1000;
-
-  return snprintf(buffer, buffer_size, scaled_value < 0 ? "-%ld.%03ld" : "%ld.%03ld",
-                  (long)(magnitude / 1000), (long)fraction);
+  dst[0] = (uint8_t)(value & 0xFF);
+  dst[1] = (uint8_t)((value >> 8) & 0xFF);
 }
 /* USER CODE END 0 */
 
@@ -130,11 +128,8 @@ int main(void)
   MX_SPI6_Init();
   /* USER CODE BEGIN 2 */
 
-  static const uint8_t bmi_header[] = "gyro_x_rad_s,gyro_y_rad_s,gyro_z_rad_s,accel_x_g,accel_y_g,accel_z_g,temp_c\r\n";
-  char bmi_uart_buffer[128];
-  char bmi_value_buffer[7][16];
+  uint8_t bmi_packet[BMI088_PACKET_SIZE];
   char bmi_error_buffer[64];
-  int bmi_uart_length;
 
   /* 使能可控 5V：板载 WS2812 和 BMI088 都由这一路供电，上电默认是关的 */
   HAL_GPIO_WritePin(Power_5V_EN_GPIO_Port, Power_5V_EN_Pin, GPIO_PIN_SET);
@@ -145,11 +140,6 @@ int main(void)
   /* 5V 有了再发一帧全灭：MCU 单独复位时灯珠会保留上一次的颜色 */
   WS2812_Ctrl(0U, 0U, 0U);
 
-  if (HAL_UART_Transmit(&huart7, (uint8_t *)bmi_header, sizeof(bmi_header) - 1U, HAL_MAX_DELAY) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
   /* 等待 BMI088 就绪：红灯 = 还没成功(会一直重试)，绿灯 = 初始化成功 */
   uint8_t bmi_error;
   uint32_t bmi_attempt = 0U;
@@ -158,7 +148,8 @@ int main(void)
   {
     WS2812_Ctrl(LED_BRIGHTNESS, 0U, 0U);
 
-    /* 只报告前几次，避免传感器一直没响应时刷屏 */
+    /* 只报告前几次，避免传感器一直没响应时刷屏。
+       这些是 ASCII 文本，上位机在同步头 0xAA 0xFF 之前会整段丢掉，不影响后面的二进制包。 */
     if (bmi_attempt < BMI088_INIT_LOG_ATTEMPTS)
     {
       int bmi_error_length = snprintf(bmi_error_buffer, sizeof(bmi_error_buffer),
@@ -186,27 +177,28 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    BMI088_read(gyro, accel, &temp);
+    BMI088_read_raw(accel_raw, gyro_raw, &temp_raw);
 
-    format_sensor_value(bmi_value_buffer[0], sizeof(bmi_value_buffer[0]), gyro[0]);
-    format_sensor_value(bmi_value_buffer[1], sizeof(bmi_value_buffer[1]), gyro[1]);
-    format_sensor_value(bmi_value_buffer[2], sizeof(bmi_value_buffer[2]), gyro[2]);
-    format_sensor_value(bmi_value_buffer[3], sizeof(bmi_value_buffer[3]), accel[0]);
-    format_sensor_value(bmi_value_buffer[4], sizeof(bmi_value_buffer[4]), accel[1]);
-    format_sensor_value(bmi_value_buffer[5], sizeof(bmi_value_buffer[5]), accel[2]);
-    format_sensor_value(bmi_value_buffer[6], sizeof(bmi_value_buffer[6]), temp);
-    bmi_uart_length = snprintf(bmi_uart_buffer, sizeof(bmi_uart_buffer),
-                   "%s,%s,%s,%s,%s,%s,%s\r\n",
-                   bmi_value_buffer[0], bmi_value_buffer[1], bmi_value_buffer[2],
-                   bmi_value_buffer[3], bmi_value_buffer[4], bmi_value_buffer[5],
-                   bmi_value_buffer[6]);
-    if (bmi_uart_length > 0 && bmi_uart_length < (int)sizeof(bmi_uart_buffer))
+    /* 20 字节包：同步头 + 加速度 + 陀螺 + 磁力(本板没有，填 0)
+       本板 BMI088 的贴装和网页参考板不同，这里对传感器数据做了一次轴向映射：
+       X = -传感器 Y、Y = 传感器 X、Z 不变(加速度和陀螺用同一套映射)；
+       网页本身还会对 ax/gy/gz 取反。如果 3D 模型的转向还是不对，
+       就继续调这里 6 个分量的符号/顺序。 */
+    bmi_packet[0] = BMI088_PACKET_SYNC1;
+    bmi_packet[1] = BMI088_PACKET_SYNC2;
+    packet_put_int16(&bmi_packet[2], (int16_t)(-accel_raw[1]));
+    packet_put_int16(&bmi_packet[4], accel_raw[0]);
+    packet_put_int16(&bmi_packet[6], accel_raw[2]);
+    packet_put_int16(&bmi_packet[8], (int16_t)(-gyro_raw[1]));
+    packet_put_int16(&bmi_packet[10], gyro_raw[0]);
+    packet_put_int16(&bmi_packet[12], gyro_raw[2]);
+    packet_put_int16(&bmi_packet[14], 0);
+    packet_put_int16(&bmi_packet[16], 0);
+    packet_put_int16(&bmi_packet[18], 0);
+
+    if (HAL_UART_Transmit(&huart7, bmi_packet, BMI088_PACKET_SIZE, HAL_MAX_DELAY) != HAL_OK)
     {
-      if (HAL_UART_Transmit(&huart7, (uint8_t *)bmi_uart_buffer,
-                            (uint16_t)bmi_uart_length, HAL_MAX_DELAY) != HAL_OK)
-      {
-        Error_Handler();
-      }
+      Error_Handler();
     }
 
     HAL_Delay(10);
