@@ -29,6 +29,7 @@
 /* USER CODE BEGIN Includes */
 #include "BMI088driver.h"
 #include "ws2812.h"
+#include "motor_power.h"    /* 电机电源开关（PC14 可控电源输出，高电平使能） */
 #include "ota_layout.h"      /* OTA_APP_BASE：本镜像链接在哪个槽（见 STM32H723xG_slots.ld） */
 #include "ota_trace.h"       /* 启动诊断（Debug 构建才输出，Release 里是空函数） */
 /* USER CODE END Includes */
@@ -179,6 +180,13 @@ int main(void)
 
   /* 五个外设的 HAL 初始化都过了；下一个可能卡死的是 HAL_Delay（要 TIM6 中断） */
   OtaTrace_Text("[app] E: MX_*_Init ok\r\n");
+
+  /* 电机电源（PC14）：**上电默认关断**。趁早把它配成推挽输出并拉低 ——
+     复位后到配好之前，那根使能线是悬空的（高电平就会上电），越早配越安全。
+     真正的使能在“按 USER_KEY / 无线 ctrl enable”时才做。
+     注意它是和板载 5V（PC15）**两路独立**的供电：5V 给 WS2812/BMI088，
+     PC14 这路给电机（及其驱动板）。 */
+  MotorPwr_Init();
 
   /* 使能可控 5V：板载 WS2812 指示灯由这一路供电，上电默认是关的 */
   HAL_GPIO_WritePin(Power_5V_EN_GPIO_Port, Power_5V_EN_Pin, GPIO_PIN_SET);

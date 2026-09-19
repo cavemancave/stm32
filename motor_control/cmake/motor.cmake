@@ -1,9 +1,10 @@
 #
 # User-owned CMake fragment: serial motor driver (protocol + transport).
 #
-#   motor.c     - 协议层：组帧 / CRC-8/MAXIM / 校验 / 各 Motor_xxx() 高层命令
-#   motor_io.c  - 传输层：请求队列 + 独占 USART10 的收发任务（FreeRTOS）
-#   motor_fmt.c - 格式化：模式名 / 故障码文本 / 角度换算
+#   motor.c        - 协议层：组帧 / CRC-8/MAXIM / 校验 / 各 Motor_xxx() 高层命令
+#   motor_io.c     - 传输层：请求队列 + 独占 USART10 的收发任务（FreeRTOS）
+#   motor_fmt.c    - 格式化：模式名 / 故障码文本 / 角度换算
+#   motor_power.c  - 电机电源开关：PC14 控制的可控电源输出（高电平使能）
 #
 # 应用层（业务任务、主控制流程）在 cmake/motor_ctrl.cmake 里，见那个文件。
 #
@@ -23,6 +24,7 @@ add_library(motor OBJECT
     ${MOTOR_DIR}/motor.c
     ${MOTOR_DIR}/motor_io.c
     ${MOTOR_DIR}/motor_fmt.c
+    ${MOTOR_DIR}/motor_power.c
 )
 
 # Driver headers (the host application includes "motor.h" / "motor_io.h" / "motor_fmt.h")

@@ -13,6 +13,8 @@
     python tools/ota.py --port COM7 reboot --boot           # 重启进 Bootloader 恢复台
     python tools/ota.py --port COM7 status                  # 电机里程/位置/故障码
     python tools/ota.py --port COM7 ctrl disable            # 电机失能
+    python tools/ota.py --port COM7 ctrl pwron              # 电机电源上电（PC14 拉高）
+    python tools/ota.py --port COM7 ctrl pwcycle            # 断电重启电机（状态卡死时用）
 
 协议：docs/ota_design.md §5。帧是 `0x00 + COBS(AA 55 VER TYPE SEQ LEN payload CRC32) + 0x00`，
 所以**裸文本日志**和**二进制帧**能在同一路串口上共存：文本里不会出现 0x00，
@@ -68,7 +70,14 @@ ST_TEXT = {
 CTRL = {
     "disable": 0x00, "enable": 0x01, "posloop": 0x02, "movepos": 0x03,
     "movedeg": 0x04, "stop": 0x05, "mute": 0x06, "pause": 0x07,
+    "pwr": 0x08,          # 电机电源（PC14）：--arg 0=断电 1=上电 2=断电重启
 }
+
+# 带固定参数的快捷命令：名字 → (cmd, arg)。想手动指定就再加 --arg。
+#   pwron   = 上电（设备会等 500 ms 让电源轨稳定）
+#   pwoff   = 断电
+#   pwcycle = 断电重启（电机状态卡死时用得上）
+CTRL_ARG = {"pwron": (0x08, 1), "pwoff": (0x08, 0), "pwcycle": (0x08, 2)}
 
 
 # ---------------------------------------------------------------------------
@@ -478,18 +487,28 @@ def cmd_status(dev: Device, args):
         raise OtaError("STATUS 没有回复（设备在跑吗）")
     if rsp[0] != ST_OK:
         raise OtaError(f"取状态失败：{ST_TEXT.get(rsp[0], rsp[0])}（电机没上电/没接线？）")
+    # 电机电源（PC14）是后加到回帧末尾的：老固件没有这一字节，所以判一下长度
+    pwr = f"  电机电源={'ON' if rsp[9] else 'OFF'}" if len(rsp) > 9 else ""
     print(f"里程={i32(rsp, 1)} 圈  位置={u16(rsp, 5)}（{u16(rsp, 5) * 360.0 / 32768:.1f}°）  "
-          f"故障码=0x{rsp[7]:02X}  模式=0x{rsp[8]:02X}")
+          f"故障码=0x{rsp[7]:02X}  模式=0x{rsp[8]:02X}{pwr}")
 
 
 def cmd_ctrl(dev: Device, args):
-    cmd = CTRL[args.cmd]
-    arg = args.arg if args.arg is not None else (
-        1 if args.cmd in ("mute", "pause") else 0)
+    if args.cmd in CTRL_ARG:
+        cmd, arg = CTRL_ARG[args.cmd]
+        if args.arg is not None:
+            arg = args.arg              # 允许手动覆盖（比如 pwr --arg 2）
+    else:
+        cmd = CTRL[args.cmd]
+        arg = args.arg if args.arg is not None else (
+            1 if args.cmd in ("mute", "pause") else 0)
     rsp = dev.request(T_CTRL, struct.pack("<BI", cmd, arg), timeout=15.0, retries=2)
     if rsp is None:
         raise OtaError(f"{args.cmd} 没有回复（使能会重试约 5 s，再等等）")
-    print(f"{args.cmd}({arg}) → {ST_TEXT.get(rsp[0], rsp[0])}  data={u32(rsp, 1)}")
+    pwr = ""
+    if cmd == 0x08:                     # 电源命令：data 返回当前状态（0/1）
+        pwr = f"  电机电源={'ON' if u32(rsp, 1) else 'OFF'}"
+    print(f"{args.cmd}({arg}) → {ST_TEXT.get(rsp[0], rsp[0])}  data={u32(rsp, 1)}{pwr}")
 
 
 def cmd_console(dev: Device, args):
@@ -593,9 +612,10 @@ def main():
     p.set_defaults(func=cmd_reboot)
 
     p = sub.add_parser("ctrl", help="控制电机（不用 OTA 时这个口就是干这个的）")
-    p.add_argument("cmd", choices=sorted(CTRL.keys()), help="disable/enable/posloop/movepos/movedeg/stop/mute/pause")
+    p.add_argument("cmd", choices=sorted(CTRL.keys()) + sorted(CTRL_ARG.keys()),
+                   help="disable/enable/posloop/movepos/movedeg/stop/mute/pause/pwr/pwron/pwoff/pwcycle")
     p.add_argument("arg", nargs="?", type=lambda s: int(s, 0), default=None,
-                   help="参数：movepos=0..32767、movedeg=0..359、mute/pause=0/1")
+                   help="参数：movepos=0..32767、movedeg=0..359、mute/pause=0/1、pwr=0/1/2")
     p.set_defaults(func=cmd_ctrl)
 
     sub.add_parser("console", help="等同于 monitor").set_defaults(func=cmd_console)

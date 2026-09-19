@@ -215,8 +215,11 @@ python tools/ota.py --port COM7 flash build/Debug/motor_control_slotB.bin
 python tools/ota.py --port COM7 rollback                   # 新固件有问题 → 一键切回旧槽
 python tools/ota.py --port COM7 reboot --boot              # 手动进 Bootloader 恢复台（救砖）
 python tools/ota.py --port COM7 monitor                    # 当串口监视器看日志
-python tools/ota.py --port COM7 status                     # 电机里程/位置/故障码
+python tools/ota.py --port COM7 status                     # 电机里程/位置/故障码 + 电源状态
 python tools/ota.py --port COM7 ctrl disable               # 电机失能（enable/posloop/movepos/... 同理）
+python tools/ota.py --port COM7 ctrl pwron                 # 电机电源上电（PC14 拉高）
+python tools/ota.py --port COM7 ctrl pwoff                 # 电机电源断电
+python tools/ota.py --port COM7 ctrl pwcycle               # 断电重启电机（状态卡死时用）
 ```
 
 `flash` 会自动挑槽（写在非活动槽）并**检查你给的 .bin 是给哪个槽编的**
@@ -327,6 +330,7 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
 | 功能 | 引脚 |
 | --- | --- |
 | 可控 5V 使能（`Power_5V_EN`，高有效） | **PC15** |
+| **电机电源使能（`Motor_Pwr_EN`，高有效）** | **PC14** |
 | 用户按键 `USER_KEY`（触发电机使能） | **PA15**（输入，无上下拉；按下为低电平。默认是 JTDI，配成 GPIO 后只能用 SWD 调试） |
 | BMI088 加速度片选 / 陀螺片选 | PC0 / PC3 |
 | SPI2：SCK / MOSI / MISO | PB13 / PC1 / PC2_C |
@@ -339,6 +343,12 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
 - 5V 在 CubeMX 里上电默认是**关**的，`main()` 的 USER CODE 2 里才打开，等 100 ms
   让电源轨稳定后再用（板载 WS2812 和 BMI088 都吃这一路；BMI088 要求 VDD 有效后
   陀螺仪约 30 ms 才可访问）。
+- **电机电源是另一路**：接在一路可控电源输出上，由 **PC14** 控制，**高电平 = 使能**。
+  同样是上电默认关断（`main()` 里 `MotorPwr_Init()` 就配成输出并拉低）。
+  按 USER_KEY / 发 `ctrl enable` 会先上电并等 `MOTOR_PWR_SETTLE_MS`(500 ms) 再发使能帧；
+  失能（含进 OTA 模式）时会把这一路一并切掉；无线侧可用 `ctrl pwron/pwoff/pwcycle` 控制。
+  ⚠ PC14/PC15 是 **OSC32_IN / OSC32_OUT**（这板子没焊 32.768 kHz 晶振，才能当 GPIO 用），
+  属于备份域、驱动能力很弱（几 mA），**只能当使能信号**，电流得电源那边出，别直接带负载。
 - WS2812 不走普通 GPIO，而是用 SPI6 的 MOSI 波形模拟单总线：**1 个 SPI 字节 = 1 个数据位**
   （`0` → `0x60`，`1` → `0x78`），一帧 24 字节（G-R-B），之后补 ≥50 µs 低电平锁存。
   SPI6 内核时钟取 HSE 24 MHz，预分频 4 → 6 MHz。

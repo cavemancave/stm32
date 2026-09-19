@@ -20,6 +20,7 @@
 
 #include "motor.h"
 #include "motor_fmt.h"
+#include "motor_power.h"    /* 电机电源开关（PC14） */
 #include "uart_log.h"
 #include "ws2812.h"
 
@@ -739,6 +740,10 @@ static uint8_t MotorCtrl_MoveTo(uint16_t angle_deg)
 /*
  * 失能总线上每一台电机（0xA0/0x09），每台都把收到的 10 字节打出来。
  * 失能后电机只是「不使劲」，通信还在，所以轮询任务照样能查状态/故障码。
+ *
+ * 最后把电机电源（PC14）也关掉：既然可控电源就是用来"不用的时候不带电"的，
+ * 失能完还给它送电就没意义了（而且升级/意外时电机带电更不安全）。
+ * 下次要使能会先重新上电（MotorPwr_OnAndSettle）。
  */
 static void MotorCtrl_DisableAll(void)
 {
@@ -760,6 +765,8 @@ static void MotorCtrl_DisableAll(void)
                        Motor_ModeName(ack.mode), hex);
         UartLog_Print(line);
     }
+
+    MotorPwr_Enable(0U);     /* 把电机电源也切了（没变化时不会重复写） */
 }
 
 /* 查一轮 0x74：里程 / 位置 / 故障码 */
@@ -875,10 +882,12 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
         *out = 0U;
     }
 
-    /* 升级期间只允许"失能 / 急停 / 静音 / 停轮询"，别的都拒绝 ——
-       正在擦写 Flash 的时候让电机转起来是找死 */
+    /* 升级期间只允许"失能 / 急停 / 静音 / 停轮询 / 断电"，别的都拒绝 ——
+       正在擦写 Flash 的时候让电机转起来是找死；
+       电源也只准"关"（OTA_BEGIN 自己会先断电），不许在升级期间把电机重新上电。 */
     if ((s_ota_mode != 0U) && (cmd != OTA_CTRL_DISABLE) && (cmd != OTA_CTRL_STOP) &&
-        (cmd != OTA_CTRL_LOG_MUTE) && (cmd != OTA_CTRL_POLL_PAUSE))
+        (cmd != OTA_CTRL_LOG_MUTE) && (cmd != OTA_CTRL_POLL_PAUSE) &&
+        !((cmd == OTA_CTRL_PWR) && (arg == 0U)))
     {
         return OTA_E_NOTALLOWED;
     }
@@ -890,6 +899,9 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
             break;
 
         case OTA_CTRL_ENABLE:
+            /* 同按键流程：先上电等稳定，再发使能帧（否则前面几次重试都是白跑） */
+            MotorPwr_OnAndSettle();
+
             if (MotorCtrl_Enable(motor_ids[0], &ack) == 0U)
             {
                 ok = 0U;
@@ -943,6 +955,31 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
             else
             {
                 (void)osTimerStart(motorPosHandle, pdMS_TO_TICKS(MOTOR_CTRL_POLL_MS));
+            }
+            break;
+
+        case OTA_CTRL_PWR:
+            /* arg：0 = 断电，1 = 上电（等稳定），2 = 断电重启（电机状态卡死时用） */
+            if (arg == 0U)
+            {
+                MotorPwr_Enable(0U);
+            }
+            else if (arg == 1U)
+            {
+                MotorPwr_OnAndSettle();
+            }
+            else if (arg == 2U)
+            {
+                MotorPwr_PowerCycle();
+            }
+            else
+            {
+                return OTA_E_PARAM;
+            }
+
+            if (out != NULL)
+            {
+                *out = MotorPwr_IsOn();    /* 告诉上位机现在到底是开是关 */
             }
             break;
 
@@ -1010,6 +1047,11 @@ void MotorCtrl_Task(void *argument)
         WS2812_SetColor(MotorCtrl_LedNextColor());   /* 按键已按下：换下一个颜色 */
 
         UartLog_Print("key pressed, enabling motor (0xA0/0x08, retry until answered)...\r\n");
+
+        /* 先把电机电源（PC14）拉起来、等电源轨稳定再发使能帧。
+           ⚠ 上电后驱动板要复位、电机内部要启动，头几条命令本来就会被丢掉；
+           不等这一下，下面那个 25 次重试就是拿来找这个"开机不响应"的。 */
+        MotorPwr_OnAndSettle();
 
         uint8_t enabled_ok = 0U;
 

@@ -24,6 +24,7 @@
 #include "uart_log.h"
 #include "ota_trace.h"
 #include "motor_ctrl.h"
+#include "motor_power.h"    /* 状态回帧里带上“电机电源是否使能” */
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -248,7 +249,7 @@ static void OtaService_Status(uint8_t seq)
     uint16_t position = 0U;
     uint8_t  fault    = 0U;
     uint8_t  mode     = 0U;
-    uint8_t  rsp[9];
+    uint8_t  rsp[10];
     uint8_t  status;
 
     status = MotorCtrl_RemoteStatus(&mileage, &position, &fault, &mode);
@@ -258,9 +259,10 @@ static void OtaService_Status(uint8_t seq)
     Ota_PutLe16(&rsp[5], position);
     rsp[7] = fault;
     rsp[8] = mode;
+    rsp[9] = MotorPwr_IsOn();     /* 电机电源（PC14）：0 = 已断电 / 1 = 已使能 */
 
     UartLog_Lock();
-    OtaLink_Send((uint8_t)(OTA_T_STATUS | 0x80U), seq, rsp, 9U);
+    OtaLink_Send((uint8_t)(OTA_T_STATUS | 0x80U), seq, rsp, 10U);
     UartLog_Unlock();
 }
 

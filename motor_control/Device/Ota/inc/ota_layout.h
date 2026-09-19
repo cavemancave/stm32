@@ -127,7 +127,8 @@ enum
     OTA_CTRL_MOVE_DEG     = 0x04U,   /* 走角度：arg = 0..359 */
     OTA_CTRL_STOP         = 0x05U,   /* 急停（0x64 给定值 = 0） */
     OTA_CTRL_LOG_MUTE     = 0x06U,   /* 静音/恢复日志：arg = 0/1 */
-    OTA_CTRL_POLL_PAUSE   = 0x07U    /* 暂停/恢复 200 ms 状态轮询：arg = 0/1 */
+    OTA_CTRL_POLL_PAUSE   = 0x07U,   /* 暂停/恢复 200 ms 状态轮询：arg = 0/1 */
+    OTA_CTRL_PWR          = 0x08U    /* 电机电源（PC14 可控电源输出）：arg = 0 断电 / 1 上电 / 2 断电重启 */
 };
 
 /* ---- 状态码：回复帧 payload[0] ---- */
