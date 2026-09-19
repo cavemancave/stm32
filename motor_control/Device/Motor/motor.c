@@ -4,21 +4,20 @@
   * @brief   串口电机驱动：一问一答，固定 10 字节帧 + CRC-8/MAXIM
   ******************************************************************************
   * 时序/流程（见 Device/Motor/inc/motor.h 里的协议说明）:
-  *   1. 清掉串口里上一次留下的字节和错误标志
-  *   2. 发 10 字节: ID | 功能码 | DATA[2..8] | CRC8
-  *   3. 收 10 字节: ID | 反馈码 | DATA[2..8] | CRC8
-  *   4. 校验 ID、反馈码、CRC-8/MAXIM
-  * 用的是阻塞收发，一问一答的节奏下最简单可靠；10 字节 @38400 只要 ~2.6ms。
+  *   1. 组帧: ID | 功能码 | DATA[2..8] | CRC8
+  *   2. 交给 motor_io.c 的收发任务发 10 字节、收 10 字节（内部会先清残留字节）
+  *   3. 校验 ID、反馈码、CRC-8/MAXIM
+  *
+  * 这个文件是**纯协议层**，不直接碰 HAL_UART：收发全走 MotorIo_Exchange()，
+  * 所以能从任意任务调用（由收发任务串行化，见 motor_io.h）。
   ******************************************************************************
   */
 
 /* Includes ------------------------------------------------------------------*/
 #include "motor.h"
+#include "motor_io.h"
 
 #include <string.h>
-
-/* Private variables ---------------------------------------------------------*/
-static UART_HandleTypeDef *motor_uart = NULL;
 
 /* Private functions ---------------------------------------------------------*/
 
@@ -48,44 +47,6 @@ static uint8_t Motor_Crc8(const uint8_t *data, uint16_t length)
 }
 
 /**
-  * @brief  清空串口接收，让每次一问一答都从干净状态开始
-  * @note   上一轮超时/校验失败时可能还有半帧残留在 RX 里，不清掉下一轮就会错位；
-  *         接收过程中出现的溢出/帧错误标志也一起清掉。
-  * @retval None
-  */
-static void Motor_FlushRx(void)
-{
-    uint8_t dummy;
-
-    /* 一字节一字节地读，读到读不出来了为止（残留不会太多） */
-    while (HAL_UART_Receive(motor_uart, &dummy, 1U, 1U) == HAL_OK)
-    {
-        /* 丢掉 */
-    }
-
-    motor_uart->ErrorCode = HAL_UART_ERROR_NONE;
-    __HAL_UART_CLEAR_FLAG(motor_uart,
-                          UART_CLEAR_OREF | UART_CLEAR_FEF | UART_CLEAR_NEF | UART_CLEAR_PEF);
-}
-
-/* Exported functions --------------------------------------------------------*/
-
-/**
-  * @brief  绑定电机所在串口并清空接收
-  * @param  huart - 电机串口句柄，传 &huart10
-  * @retval None
-  */
-void Motor_Init(UART_HandleTypeDef *huart)
-{
-    motor_uart = huart;
-
-    if (motor_uart != NULL)
-    {
-        Motor_FlushRx();
-    }
-}
-
-/**
   * @brief  一问一答：发一条 10 字节命令，收一条 10 字节回复并校验
   * @param  motor_id  - 目标电机 ID（帧首字节，反馈里也必须一致）
   * @param  cmd       - 发送帧 DATA[1] 功能码
@@ -101,19 +62,13 @@ uint8_t Motor_Transaction(uint8_t motor_id, uint8_t cmd, const uint8_t *payload,
     uint8_t frame[MOTOR_FRAME_SIZE];
     uint8_t rx[MOTOR_FRAME_SIZE] = {0};
     const uint8_t payload_zero[MOTOR_FRAME_PAYLOAD_SIZE] = {0};
-    HAL_StatusTypeDef rx_status;
-
-    if (motor_uart == NULL)
-    {
-        return 0U;
-    }
 
     if (payload == NULL)
     {
         payload = payload_zero;
     }
 
-    /* 发送: ID | 功能码 | DATA[2..8] | CRC8 */
+    /* 组帧: ID | 功能码 | DATA[2..8] | CRC8 */
     frame[0] = motor_id;
     frame[1] = cmd;
 
@@ -124,7 +79,7 @@ uint8_t Motor_Transaction(uint8_t motor_id, uint8_t cmd, const uint8_t *payload,
 
     frame[MOTOR_FRAME_SIZE - 1U] = Motor_Crc8(frame, MOTOR_FRAME_SIZE - 1U);
 
-    /* raw 清零：失败时全 0 = 一个字节都没收到 */
+    /* raw 先清零：失败时全 0 = 一个字节都没收到 */
     if (raw != NULL)
     {
         for (uint8_t i = 0U; i < MOTOR_FRAME_SIZE; i++)
@@ -133,25 +88,21 @@ uint8_t Motor_Transaction(uint8_t motor_id, uint8_t cmd, const uint8_t *payload,
         }
     }
 
-    Motor_FlushRx();
-
-    if (HAL_UART_Transmit(motor_uart, frame, MOTOR_FRAME_SIZE, MOTOR_FRAME_TIMEOUT_MS) != HAL_OK)
+    /* 一次收发：谁调都行，内部自己串行化（收不满时 rx 里没被写到的字节保持 0） */
+    if (MotorIo_Exchange(frame, MOTOR_FRAME_SIZE, rx, MOTOR_FRAME_SIZE) == 0U)
     {
+        /* 收不满也把已经落地的那几个字节留进 raw，方便定位接线/波特率问题 */
+        if (raw != NULL)
+        {
+            memcpy(raw, rx, MOTOR_FRAME_SIZE);
+        }
+
         return 0U;
     }
-
-    /* 收 10 字节反馈；收不满也把已收到的部分留进 raw，方便定位接线/波特率问题 */
-    rx_status = HAL_UART_Receive(motor_uart, rx, MOTOR_FRAME_SIZE, MOTOR_FRAME_TIMEOUT_MS);
 
     if (raw != NULL)
     {
         memcpy(raw, rx, MOTOR_FRAME_SIZE);
-    }
-
-    if (rx_status != HAL_OK)
-    {
-        Motor_FlushRx();
-        return 0U;
     }
 
     /* 帧头校验：反馈的 ID 必须就是刚问的那台，否则可能是别的电机在抢答/串口错位 */
@@ -222,6 +173,55 @@ uint8_t Motor_SetMode(uint8_t motor_id, uint8_t mode, MotorMode *result)
 uint8_t Motor_Enable(uint8_t motor_id, MotorMode *result)
 {
     return Motor_SetMode(motor_id, MOTOR_MODE_ENABLE, result);
+}
+
+/**
+  * @brief  驱动电机转动 / 走位置：发 0x64，等 0x65
+  * @note   给定值的含义随当前模式变（电流环=电流、速度环=速度、位置环=目标位置）。
+  *         发送帧 DATA[2..3] = 给定值（高字节在前），DATA[6] = 加速时间，
+  *         DATA[7] = 刹车（0xFF 刹车，其它不刹车）。
+  * @retval 1 = 收到合法反馈，0 = 失败
+  */
+uint8_t Motor_SetValue(uint8_t motor_id, int16_t value, uint8_t accel_time,
+                       uint8_t brake, MotorValueAck *result)
+{
+    uint8_t payload[MOTOR_FRAME_PAYLOAD_SIZE] = {0};
+    uint8_t reply[MOTOR_FRAME_PAYLOAD_SIZE];
+    uint8_t *raw = NULL;
+    uint8_t  ok;
+
+    if (result != NULL)
+    {
+        raw        = result->raw;
+        result->id = motor_id;
+        result->speed       = 0;
+        result->current     = 0;
+        result->accel_time  = 0x00U;
+        result->temperature = 0x00U;
+        result->fault       = 0x00U;
+    }
+
+    payload[0] = (uint8_t)((uint16_t)value >> 8);    /* DATA[2] 给定值高 8 位 */
+    payload[1] = (uint8_t)((uint16_t)value & 0xFFU); /* DATA[3] 给定值低 8 位 */
+    /* payload[2]/[3] = DATA[4]/[5]，固定 0 */
+    payload[4] = accel_time;                         /* DATA[6] 加速时间 */
+    payload[5] = brake;                              /* DATA[7] 刹车 */
+    /* payload[6] = DATA[8]，固定 0 */
+
+    ok = Motor_Transaction(motor_id, MOTOR_CMD_SET_VALUE, payload,
+                           MOTOR_REPLY_SET_VALUE, raw, reply);
+
+    if ((ok != 0U) && (result != NULL))
+    {
+        /* 反馈 DATA[2..3] 速度、DATA[4..5] 电流、DATA[6] 加速时间、DATA[7] 温度、DATA[8] 故障码 */
+        result->speed       = (int16_t)(((uint16_t)reply[0] << 8) | (uint16_t)reply[1]);
+        result->current     = (int16_t)(((uint16_t)reply[2] << 8) | (uint16_t)reply[3]);
+        result->accel_time  = reply[4];
+        result->temperature = reply[5];
+        result->fault       = reply[6];
+    }
+
+    return ok;
 }
 
 /**

@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "FreeRTOS.h"
+#include "cmsis_os2.h"
 #include "dma.h"
 #include "spi.h"
 #include "usart.h"
@@ -27,9 +29,6 @@
 /* USER CODE BEGIN Includes */
 #include "BMI088driver.h"
 #include "ws2812.h"
-#include "motor.h"
-#include <stdio.h>
-#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,27 +39,16 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* ---- 电机使能（按键触发，当前的主流程）---- */
-
-/* 挂在同一条串口上的电机台数（和下面 motor_ids[] 的元素个数要一致）
-   当前只测 1 台（ID1，ID 脚接地）；两台都挂上时改成 2U 并补全 motor_ids[] */
-#define MOTOR_COUNT               1U
-
-/* USER_KEY（PA15）的消抖时间：按下后隔这么久再确认一次 */
-#define KEY_DEBOUNCE_MS           20U
-
-/* 按键按下的电平：按键接地 → 按下读到低电平。
-   如果实测反了（不按也一直触发），把这里改成 GPIO_PIN_SET */
-#define USER_KEY_PRESSED_LEVEL    GPIO_PIN_RESET
-
-/* 使能成功之后：版本号只查一次，随后每隔这么久查一轮里程/故障码（0x74） */
-#define MOTOR_STATUS_POLL_MS      200U
+/* 电机相关的参数（MOTOR_COUNT / KEY_DEBOUNCE_MS / USER_KEY_PRESSED_LEVEL /
+   轮询周期 ...）都搬到 Device/Motor/motor_ctrl.c 了，要改去那边改。
+   这里只留 main.c 自己用得到的。 */
 
 /* ---- 板载 WS2812 指示灯 ----
    颜色用枚举（见 ws2812.h 的 WS2812_COLOR_xxx），亮度不在主流程里设，
    用驱动里的"总亮度"默认值 WS2812_DEFAULT_BRIGHTNESS(32)——要调就改 ws2812.h 那个宏，
    或者开机时自己调 WS2812_SetBrightness()。
-   每次点灯都用 Motor_LedNextColor() 按枚举顺序取下一个颜色：
+   点灯的状态机（MotorCtrl_LedNextColor）搬到了 Device/Motor/motor_ctrl.c，
+   顺序不变：
    RED → GREEN → BLUE → YELLOW → CYAN → MAGENTA → WHITE → RED ...（跳过 OFF） */
 
 /* 使能可控 5V 之后，等 5V 轨稳定再说：板载 WS2812（以及后面的 BMI088）都吃这一路。
@@ -93,162 +81,25 @@
 
 /* USER CODE BEGIN PV */
 
-/* 这条串口上挂的电机 ID，按顺序依次问（改这里的同时改 MOTOR_COUNT） */
-static const uint8_t motor_ids[MOTOR_COUNT] = { 1U };
-
-/* 指示灯下一次要用枚举里的哪个颜色（上电第一个状态 = 红） */
-static WS2812_Color_t motor_led_color = WS2812_COLOR_RED;
+/* 业务都在 FreeRTOS 任务里了，见 Device/Motor/ 下的 motor_io.c / motor_ctrl.c。
+   main.c 只负责：外设初始化 → 5V 上电时序 → 启动调度器。 */
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MPU_Config(void);
+void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 #if 0 /* BMI088 打包用的小工具，数据暂时不发 */
 static void packet_put_int16(uint8_t *dst, int16_t value);
 #endif
-static void Uart7_Print(const char *text);
-static void WaitUserKeyPress(void);
-static const char *Motor_ModeName(uint8_t mode);
-static WS2812_Color_t Motor_LedNextColor(void);
-static void Motor_FaultText(uint8_t fault, char *out, size_t out_size);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 int16_t gyro_raw[3], accel_raw[3], temp_raw;
-
-/* 往 UART7(115200) 打一行文本，就是调试口 */
-static void Uart7_Print(const char *text)
-{
-  (void)HAL_UART_Transmit(&huart7, (uint8_t *)text, (uint16_t)strlen(text), HAL_MAX_DELAY);
-}
-
-/*
- * 模式值 -> 可读名字，只用来打日志。
- * 注意 0xA0 反馈里的模式值是**切换后的实际模式**：发 0x08（使能）之后电机回的是
- * 0x01（默认电流环），不会把 0x08 回显回来。
- */
-static const char *Motor_ModeName(uint8_t mode)
-{
-  switch (mode)
-  {
-    case MOTOR_MODE_OPEN_LOOP:      return "open loop";
-    case MOTOR_MODE_CURRENT:        return "current loop";
-    case MOTOR_MODE_SPEED:          return "speed loop";
-    case MOTOR_MODE_ENABLE:         return "enable";
-    case MOTOR_MODE_DISABLE:        return "disable";
-    case MOTOR_MODE_TURN_BACK_150:  return "turn back 150deg";
-    case MOTOR_MODE_LINK_LOSS_ON:   return "link-loss on";
-    case MOTOR_MODE_LINK_LOSS_OFF:  return "link-loss off";
-    default:                        return "unknown";
-  }
-}
-
-/*
- * 等一次按键（USER_KEY = PA15，低电平按下）：
- * 先等按下并消抖，再等松手，这样按住不放也只算一次触发。
- * 轮询实现，够简单；按键只需要在主循环里响应，不占用中断。
- */
-static void WaitUserKeyPress(void)
-{
-  /* 等按下：连续两次读到按下电平才算数（消抖） */
-  while (1)
-  {
-    if (HAL_GPIO_ReadPin(USER_KEY_GPIO_Port, USER_KEY_Pin) == USER_KEY_PRESSED_LEVEL)
-    {
-      HAL_Delay(KEY_DEBOUNCE_MS);
-
-      if (HAL_GPIO_ReadPin(USER_KEY_GPIO_Port, USER_KEY_Pin) == USER_KEY_PRESSED_LEVEL)
-      {
-        break;   /* 稳定按下了 */
-      }
-    }
-
-    HAL_Delay(10);
-  }
-
-  /* 等松手：不然按住不放会在循环里被当成连按 */
-  while (HAL_GPIO_ReadPin(USER_KEY_GPIO_Port, USER_KEY_Pin) == USER_KEY_PRESSED_LEVEL)
-  {
-    HAL_Delay(10);
-  }
-}
-
-/*
- * 每次点灯都调它取枚举里的下一个颜色：
- * RED → GREEN → BLUE → YELLOW → CYAN → MAGENTA → WHITE → RED ...
- * 跳过 WS2812_COLOR_OFF（灭）和 WS2812_COLOR_COUNT（只是个计数）。
- */
-static WS2812_Color_t Motor_LedNextColor(void)
-{
-  WS2812_Color_t color = motor_led_color;
-
-  motor_led_color = (WS2812_Color_t)((uint32_t)motor_led_color + 1U);
-  if ((uint32_t)motor_led_color >= (uint32_t)WS2812_COLOR_COUNT)
-  {
-    motor_led_color = WS2812_COLOR_RED;   /* 绕回第一个颜色 */
-  }
-
-  return color;
-}
-
-/*
- * 故障码 -> 可读文本（按位拼，多个故障用 | 连起来；无故障 = "none"）。
- * 认不出来的位统一写成 "other"，原始码由调用方自己打（fault=0x%02X）。
- * 位定义见 motor.h 的 MOTOR_FAULT_xxx。
- */
-static void Motor_FaultText(uint8_t fault, char *out, size_t out_size)
-{
-  static const struct
-  {
-    uint8_t     bit;
-    const char *name;
-  } faults[] =
-  {
-    { MOTOR_FAULT_HALL,        "hall"        },
-    { MOTOR_FAULT_OVERCURRENT, "overcurrent" },
-    { MOTOR_FAULT_STALL,       "stall"       },
-    { MOTOR_FAULT_OVERTEMP,    "overtemp"    },
-    { MOTOR_FAULT_LINK_LOSS,   "link-loss"   },
-    { MOTOR_FAULT_VOLTAGE,     "voltage"     },
-  };
-
-  uint8_t known = 0x00U;
-  size_t  used  = 0U;
-
-  if ((out == NULL) || (out_size == 0U))
-  {
-    return;
-  }
-
-  out[0] = '\0';
-
-  for (uint8_t i = 0U; i < (sizeof(faults) / sizeof(faults[0])); i++)
-  {
-    if ((fault & faults[i].bit) != 0U)
-    {
-      (void)snprintf(&out[used], out_size - used, "%s%s",
-                     (used != 0U) ? "|" : "", faults[i].name);
-      used  = strlen(out);
-      known = (uint8_t)(known | faults[i].bit);
-    }
-  }
-
-  /* 已知位之外还有置位（手册没定义的位）就标个 other */
-  if ((uint8_t)(fault & (uint8_t)(~known)) != 0x00U)
-  {
-    (void)snprintf(&out[used], out_size - used, "%sother", (used != 0U) ? "|" : "");
-    used = strlen(out);
-  }
-
-  if (used == 0U)
-  {
-    (void)snprintf(out, out_size, "none");
-  }
-}
 
 #if 0 /* ===== BMI088 流程暂时关掉，后面要放开时把 #if 0 改成 #if 1 ===== */
 static void packet_put_int16(uint8_t *dst, int16_t value)
@@ -298,8 +149,6 @@ int main(void)
   MX_USART10_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  char motor_line[160];
-
   /* 使能可控 5V：板载 WS2812 指示灯由这一路供电，上电默认是关的 */
   HAL_GPIO_WritePin(Power_5V_EN_GPIO_Port, Power_5V_EN_Pin, GPIO_PIN_SET);
 
@@ -309,19 +158,24 @@ int main(void)
   /* 5V 有了再发一帧全灭：MCU 单独复位时灯珠会保留上一次的颜色 */
   WS2812_Ctrl(0U, 0U, 0U);
 
-  /* 电机挂在 USART10 上：PE2 = RX、PE3 = TX，38400 8N1（见 usart.c）。
-     ⚠ PE3 (TX) 必须是开漏 (GPIO_MODE_AF_OD)：电机控制板是 5V TTL 单总线，
-     高电平靠总线上拉；TX 推挽会让输出 MOS 管常通，在总线上误发信号。 */
-  Motor_Init(&huart10);
+  /* ⚠ 电机挂在 USART10 上：PE2 = RX、PE3 = TX，38400 8N1（见 usart.c）。
+     PE3 (TX) 必须是开漏 (GPIO_MODE_AF_OD)：电机控制板是 5V TTL 单总线，
+     高电平靠总线上拉；TX 推挽会让输出 MOS 管常通，在总线上误发信号。
+     这个 Mode 是 CubeMX 按 PE3 的 Output type 生成的，要改请在 CubeMX 里改。 */
 
-  Uart7_Print("motor test: press USER_KEY (PA15) to send enable (0xA0/0x08) on USART10\r\n");
-
-  MotorMode motor_enable_ack[MOTOR_COUNT];
-  uint8_t   key_round = 0U;
-
-  WS2812_SetColor(Motor_LedNextColor());   /* 第一个状态 = 红，等按键 */
+  /* 业务相关的初始化（日志互斥、电机串口 + 请求队列、轮询任务/信号量）都在
+     MX_FREERTOS_Init() 里做：那些对象要求 osKernelInitialize() 已经跑过。 */
 
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -330,6 +184,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+#if 0 /* ---- 旧主循环：按键使能 + 200ms 状态轮询 ----
+         已搬到 Device/Motor/：控制流程见 motor_ctrl.c 的 MotorCtrl_Task()，
+         状态轮询见 MotorCtrl_PollTask()。留在这里备查，不再编译。 ---- */
     /* 等一次按键（PA15），按下后：给总线上每台电机各发一次使能指令
        （0xA0/0x08，只发一次、不重试），再把串口收到的 10 字节原样打到 UART7。 */
     Uart7_Print("press USER_KEY (PA15) to send enable ...\r\n");
@@ -458,6 +315,7 @@ int main(void)
         HAL_Delay(MOTOR_STATUS_POLL_MS);
       }
     }
+#endif /* 旧主循环 */
 
 #if 0 /* BMI088 的数据本轮先不发，要放开时把这里改回 #if 1，
          同时把 USER CODE 2 / USER CODE 0 里对应的 #if 0 一起打开。 */
@@ -582,6 +440,28 @@ void MPU_Config(void)
   /* Enables the MPU */
   HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
 }
 
 /**

@@ -75,6 +75,10 @@
 #define MOTOR_MODE_OPEN_LOOP     0x00U  /* 开环 */
 #define MOTOR_MODE_CURRENT       0x01U  /* 电流环 */
 #define MOTOR_MODE_SPEED         0x02U  /* 速度环 */
+/* ⚠ 位置环的 0x03 在 docs/specification.md（手册 5.3 的主要模式表）里**没有**，
+   是从 docs/M63A快捷指令集.cfg 的「电机1切换位置环=...|01A003000000000000D9」
+   里得到的；位置环下 0x64 的给定值 = 目标位置（0~32767 对应 0~360°）。 */
+#define MOTOR_MODE_POSITION      0x03U  /* 位置环 */
 #define MOTOR_MODE_ENABLE        0x08U  /* 电机使能（使能后默认电流环） */
 #define MOTOR_MODE_DISABLE       0x09U  /* 电机失能 */
 #define MOTOR_MODE_TURN_BACK_150 0x0AU  /* 电机后转 150±10° */
@@ -127,11 +131,27 @@ typedef struct
   uint8_t  raw[MOTOR_FRAME_SIZE]; /* 原始 10 字节，失败时用来看现场 */
 } MotorStatus;
 
-/* 绑定串口（传 &huart10）并清掉串口里的残留字节 */
-void Motor_Init(UART_HandleTypeDef *huart);
+/* 驱动转动反馈（0x64->0x65）：速度 / 电流 / 温度 / 故障码 */
+typedef struct
+{
+  uint8_t  id;                    /* 反馈帧的 ID（= 查询时用的 ID） */
+  int16_t  speed;                 /* 速度反馈，-3800~3800 对应 -380~380 rpm */
+  int16_t  current;               /* 电流反馈，-32767~32767 对应 -4A~4A */
+  uint8_t  accel_time;            /* 加速时间（回显） */
+  uint8_t  temperature;           /* 绕组温度，单位 ℃ */
+  uint8_t  fault;                 /* 故障码，位定义见 MOTOR_FAULT_xxx */
+  uint8_t  raw[MOTOR_FRAME_SIZE]; /* 原始 10 字节，失败时用来看现场 */
+} MotorValueAck;
 
 /*
- * 发送一条 10 字节命令并校验回复（一问一答，内部阻塞）。
+ * ⚠ 串口不在这个文件里绑定：串口的独占用 motor_io.c 负责，
+ *   路由 MotorIo_Init(&huart10) 完成（freertos.c 的 MX_FREERTOS_Init() 里调）。
+ *   下面的 Motor_xxx() 都是**线程安全**的：内部走 MotorIo_Exchange()，
+ *   由收发任务串行执行，任何任务里都能直接调。
+ */
+
+/*
+ * 发送一条 10 字节命令并校验回复（一问一答）。
  *   motor_id  - 目标电机 ID（帧首字节）
  *   cmd       - 发送帧 DATA[1] 功能码
  *   payload   - DATA[2..8] 共 7 字节，传 NULL 表示全 0
@@ -139,6 +159,9 @@ void Motor_Init(UART_HandleTypeDef *huart);
  *   raw       - 输出（可传 NULL）：收到的原始 10 字节；收不满时是已收到的部分
  *   reply     - 输出（可传 NULL）：反馈帧 DATA[2..8] 共 7 字节
  * 返回 1 = 成功（ID / 功能码 / CRC8 全部对得上），0 = 失败。
+ *
+ * 组帧/校验在这里，真正的收发交给 motor_io.c 的收发任务，所以本函数可以
+ * 从任意任务调用（内部会阻塞到收发结束，最长约 2x MOTOR_FRAME_TIMEOUT_MS）。
  */
 uint8_t Motor_Transaction(uint8_t motor_id, uint8_t cmd, const uint8_t *payload,
                           uint8_t reply_cmd, uint8_t *raw, uint8_t *reply);
@@ -158,6 +181,20 @@ uint8_t Motor_Enable(uint8_t motor_id, MotorMode *result);
 
 /* 失能电机（= SetMode(MOTOR_MODE_DISABLE)） */
 uint8_t Motor_Disable(uint8_t motor_id, MotorMode *result);
+
+/*
+ * 驱动电机转动 / 走位置：发 0x64，等 0x65。
+ *   value      - 给定值，含义随当前模式：
+ *                电流环 = 电流(-32767~32767 ↔ -4A~4A)
+ *                速度环 = 速度(-3800~3800 ↔ -380rpm~380rpm)
+ *                位置环 = 目标位置(0~32767 ↔ 0~360°，见 Motor_AngleToPosition())
+ *   accel_time - DATA[6]：速度环下每 1rpm 的加速时间，单位 1ms；0 按 1 处理
+ *   brake      - DATA[7]：0xFF 刹车，其它值不刹车（速度环下有效）
+ *   result     - 输出（可传 NULL）：速度/电流/温度/故障码和原始字节
+ * 返回 1 = 收到合法反馈，0 = 失败。
+ */
+uint8_t Motor_SetValue(uint8_t motor_id, int16_t value, uint8_t accel_time,
+                       uint8_t brake, MotorValueAck *result);
 
 /* 查询当前模式：发 0x75，等 0x76 */
 uint8_t Motor_QueryMode(uint8_t motor_id, MotorMode *result);

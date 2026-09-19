@@ -69,7 +69,9 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # driver configuration survives every "Generate Code" run.
 include(cmake/bmi088.cmake)
 include(cmake/ws2812.cmake)
+include(cmake/uart_log.cmake)
 include(cmake/motor.cmake)
+include(cmake/motor_ctrl.cmake)
 
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
