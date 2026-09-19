@@ -706,9 +706,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     ap.add_argument("--port", help="电脑这边的配对串口，如 COM7 或 /dev/ttyUSB0（selftest 不需要）")
-    ap.add_argument("--baud", type=int, default=115200,
-                    help="默认 115200（= 固件 OTA_PORT_BAUD）；要和模块、固件都一致。"
-                         "固件改成 921600 后这里也要跟（模块同样要改）")
+    ap.add_argument("--baud", type=int, default=921600,
+                    help="默认 921600（= 固件 OTA_PORT_BAUD）。设备跑在旧固件/BL 里时是 115200；"
+                         "两个无线模块的串口波特率也要和它一致")
     ap.add_argument("-q", "--quiet", action="store_true", help="不要把设备日志打到屏幕上")
 
     sub = ap.add_subparsers(dest="action", required=True)
