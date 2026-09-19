@@ -212,9 +212,10 @@ static uint8_t ota_host_begin(const uint8_t *pl, uint16_t len, uint8_t *rsp)
         char line[128];
 
         (void)snprintf(line, sizeof(line),
-                       "ota: BEGIN slot=%c size=%lu crc=0x%08lX resume=%lu\r\n",
+                       "ota: BEGIN slot=%c size=%lu crc=0x%08lX resume=%lu erase=%lu sector(s)\r\n",
                        (slot == OTA_SLOT_A) ? 'A' : 'B',
-                       (unsigned long)size, (unsigned long)crc, (unsigned long)resume);
+                       (unsigned long)size, (unsigned long)crc,
+                       (unsigned long)resume, (unsigned long)OtaFlash_LastEraseSectors());
         ota_host_log(line);
     }
 

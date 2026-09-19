@@ -16,8 +16,15 @@
 #include <stdint.h>
 #include "ota_layout.h"
 
-/* 擦掉某个槽（3 个扇区，ms 级 —— 只在 OTA_BEGIN 里调用） */
+/* 擦掉某个槽（3 个扇区）—— `erase` 命令用，语义就是"把这个槽清空" */
 int8_t OtaFlash_EraseSlot(uint8_t slot);
+
+/* 只擦"这个尺寸的镜像真正会占用"的扇区：ceil(size / 128 KB)，1~3 个。
+   下载开始时用这个（比整槽快 ~2 s；安全性的论证写在 ota_flash.c 里）。 */
+int8_t OtaFlash_EraseSlotForSize(uint8_t slot, uint32_t size);
+
+/* 最近一次槽擦除擦了几个扇区（只给日志用） */
+uint32_t OtaFlash_LastEraseSectors(void);
 
 /* 擦掉元数据扇区（只在元数据记录写满 512 条时才会用到） */
 int8_t OtaFlash_EraseMeta(void);

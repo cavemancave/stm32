@@ -20,6 +20,40 @@
 
 /* Private functions ---------------------------------------------------------*/
 
+static uint32_t s_last_erase_sectors;    /* 最近一次槽擦除擦了几个扇区（只给日志用） */
+
+static void ota_flash_clear_errors(void);   /* 下面几个 helper 定义在后面 */
+
+/* 从槽的第一个扇区开始擦 n 个扇区（n 必须是 1..OTA_SLOT_SECTOR_COUNT） */
+static int8_t ota_flash_erase_slot_sectors(uint8_t slot, uint32_t n)
+{
+    static const uint32_t first_sector[OTA_SLOT_COUNT] = OTA_SLOT_SECTOR_FIRST;
+    FLASH_EraseInitTypeDef erase = {0};
+    uint32_t               sector_error = 0U;
+    HAL_StatusTypeDef      st;
+
+    if ((slot >= OTA_SLOT_COUNT) || (n == 0U) || (n > OTA_SLOT_SECTOR_COUNT))
+    {
+        return OTA_E_PARAM;
+    }
+
+    s_last_erase_sectors = n;
+
+    (void)HAL_FLASH_Unlock();
+    ota_flash_clear_errors();
+
+    erase.TypeErase    = FLASH_TYPEERASE_SECTORS;
+    erase.Banks        = FLASH_BANK_1;
+    erase.Sector       = first_sector[slot];
+    erase.NbSectors    = n;
+    erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;   /* VDD 2.7~3.6 V（板子 3.3 V） */
+
+    st = HAL_FLASHEx_Erase(&erase, &sector_error);
+    (void)HAL_FLASH_Lock();
+
+    return (st == HAL_OK) ? (int8_t)OTA_OK : (int8_t)OTA_E_ERASE;
+}
+
 /* 擦之前/写之前都要清一次错误标志：H7 的 ECC/写保护错误标志会粘住，
    不清的话后面每次操作都会直接返回错误 */
 static void ota_flash_clear_errors(void)
@@ -54,29 +88,39 @@ static uint8_t ota_flash_is_blank_word(uint32_t addr)
 
 int8_t OtaFlash_EraseSlot(uint8_t slot)
 {
-    static const uint32_t first_sector[OTA_SLOT_COUNT] = OTA_SLOT_SECTOR_FIRST;
-    FLASH_EraseInitTypeDef erase = {0};
-    uint32_t               sector_error = 0U;
-    HAL_StatusTypeDef      st;
+    return ota_flash_erase_slot_sectors(slot, OTA_SLOT_SECTOR_COUNT);
+}
 
-    if (slot >= OTA_SLOT_COUNT)
+int8_t OtaFlash_EraseSlotForSize(uint8_t slot, uint32_t size)
+{
+    /* 只擦镜像真正会占用的那些扇区：ceil(size / 128 KB)，1~3 个。
+
+       为什么可以不全擦（2026-09-19 实测 + 代码核对）：
+         - 总是从槽的**第一个**扇区开始往上擦 ⇒ 槽开头的向量表和 64 字节空白采样
+           （OtaFlash_IsBlank 就是看开头）都是干净的；
+         - BL 判断镜像好坏用的是元数据里的 size/crc，OtaFlash_SlotCrc 只读 size 字节，
+           镜像尾巴后面剩下的旧数据根本没人读；
+         - 回滚/切槽靠的是**另一个**槽，我们不动它。
+       好处：一个 113 KB 的镜像从“擦 3 个扇区（~2.9 s）”变成“擦 1 个（~1 s）”。
+       实测扇区擦除 0.97 s/个（384 KB / 3 个 ≈ 2.9 s），是整次升级里最大的一块时间。 */
+    uint32_t n = (size + OTA_FLASH_SECTOR_SIZE - 1U) / OTA_FLASH_SECTOR_SIZE;
+
+    if (n == 0U)
     {
-        return OTA_E_PARAM;
+        n = 1U;      /* size = 0 时也留一个扇区，别把参数错误变成无声的“什么都没干” */
     }
 
-    (void)HAL_FLASH_Unlock();
-    ota_flash_clear_errors();
+    if (n > OTA_SLOT_SECTOR_COUNT)
+    {
+        n = OTA_SLOT_SECTOR_COUNT;
+    }
 
-    erase.TypeErase    = FLASH_TYPEERASE_SECTORS;
-    erase.Banks        = FLASH_BANK_1;
-    erase.Sector       = first_sector[slot];
-    erase.NbSectors    = OTA_SLOT_SECTOR_COUNT;
-    erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;   /* VDD 2.7~3.6 V（板子 3.3 V） */
+    return ota_flash_erase_slot_sectors(slot, n);
+}
 
-    st = HAL_FLASHEx_Erase(&erase, &sector_error);
-    (void)HAL_FLASH_Lock();
-
-    return (st == HAL_OK) ? (int8_t)OTA_OK : (int8_t)OTA_E_ERASE;
+uint32_t OtaFlash_LastEraseSectors(void)
+{
+    return s_last_erase_sectors;     /* 给日志用的，看这次到底擦了几个扇区 */
 }
 
 int8_t OtaFlash_EraseMeta(void)
@@ -171,7 +215,11 @@ int8_t OtaFlash_Write(uint32_t addr, const uint8_t *data, uint32_t len)
 
         /* 一次调用 = 一个 flash word，addr 始终是 32 字节对齐的（下面按 WORD_SIZE 步进）
            ⚠ 绝不能写成 "for (i = 0; i < ALIGN; i += WORD_SIZE)"：WORD_SIZE 一旦比 ALIGN 小，
-             第二次调用的地址就不对齐了 → 精确总线错误（BFAR = 该 flash word 基址）。 */
+             第二次调用的地址就不对齐了 → 精确总线错误（BFAR = 该 flash word 基址）。
+
+           实测（DWT 周期计数，2026-09-19）：blank 检查 3.2 µs/字、HAL_FLASH_Program
+           98 µs/字 ⇒ 113 KB 镜像总共只花 0.35 s，写 flash 从来就不是瓶颈 ——
+           真正的大头是 BEGIN 里的扇区擦除（0.97 s/扇区），见 OtaFlash_EraseSlotForSize。 */
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD, addr,
                               (uint32_t)(uintptr_t)word) != HAL_OK)
         {

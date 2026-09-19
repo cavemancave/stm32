@@ -88,10 +88,10 @@ int8_t OtaSession_Begin(uint8_t slot, uint32_t size, uint32_t crc, uint32_t ver,
         return OTA_OK;
     }
 
-    /* 全新下载：**先把整个槽擦干净**。
-       整个流程里唯一的长时间 Flash 操作，放在 BEGIN（此时还没有数据在传），
+    /* 全新下载：**把镜像会用到的扇区先擦干净**（不是整个槽 —— 见 OtaFlash_EraseSlotForSize）。
+       擦除是整个流程里唯一的长耗时 Flash 操作，放在 BEGIN（此时还没有数据在传），
        之后就只剩 32 字节 flash word 的编程停顿了。 */
-    st = OtaFlash_EraseSlot(slot);
+    st = OtaFlash_EraseSlotForSize(slot, size);
 
     if (st != OTA_OK)
     {

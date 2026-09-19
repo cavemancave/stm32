@@ -478,9 +478,9 @@ def cmd_flash(dev: Device, args):
         print("  等设备重启并切槽（最多 20 s）...")
         deadline = time.time() + 20
         while time.time() < deadline:
-            time.sleep(1.0)
+            time.sleep(0.2)          # 设备其实 1 s 内就起来了：轮询细一点，省掉白等
             try:
-                info2 = dev.get_info(timeout=1.5, retries=1)
+                info2 = dev.get_info(timeout=0.5, retries=1)
             except OtaError:
                 continue
             if info2["active"] == target or info2["boot"] == target:
@@ -728,8 +728,8 @@ def main():
                                  epilog=__doc__)
     ap.add_argument("--port", help="电脑这边的配对串口，如 COM7 或 /dev/ttyUSB0（selftest 不需要）")
     ap.add_argument("--baud", type=int, default=921600,
-                    help="默认 921600（= 固件 OTA_PORT_BAUD）。设备跑在旧固件/BL 里时是 115200；"
-                         "两个无线模块的串口波特率也要和它一致")
+                    help="默认 921600（= 固件 OTA_PORT_BAUD，BL 恢复台现在也是这个值）。"
+                         "只遇到“没重烧过 motor_boot 的旧 BL”时才需要改成 115200")
     ap.add_argument("-q", "--quiet", action="store_true", help="不要把设备日志打到屏幕上")
 
     sub = ap.add_subparsers(dest="action", required=True)
