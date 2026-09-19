@@ -172,6 +172,15 @@ class Device:
         self.ser = serial.Serial(port, baud, timeout=0.02)
         self.quiet = quiet
         self.seq = 0
+        self._reset_parser()
+
+    def _reset_parser(self):
+        """初始化“解帧用得到的那几个字段”。
+
+        ⚠ 必须集中在这里，不要在 __init__ 里散着写：自检（cmd_selftest）是用
+          Device.__new__(Device) 造个假对象直接喂字节的，漏一个字段就会在上面报
+          AttributeError（加 rx_total 时就踩过一次，而且当时没跑自检就提交了）。
+        """
         self.rx_total = 0               # 一共收到多少字节（=0 基本就是波特率/模块问题）
         self._in_frame = False          # False = 正在看文本；True = 攒帧
         self._buf = bytearray()
@@ -238,18 +247,33 @@ class Device:
         self.frames.append((data[3], data[4], data[7:7 + ln]))
 
     def pump(self, timeout: float):
-        """读串口直到超时，期间的文本直接打出来、帧进 self.frames"""
+        """读串口直到超时（或收到帧），期间的文本直接打出来、帧进 self.frames
+
+        ⚠ 两个坑（实测每包白白多等 ~100 ms）：
+          1) 不能用 self.ser.read(256) —— pyserial 的 read(n) 会一直等到读满 n 个字节
+             **或者超时**才返回，所以一条 19 字节的回复每次都要把剩下的超时耗光；
+             要用 in_waiting “有多少读多少”。
+          2) 帧已经解出来就别再把剩下的时间等完 —— 否则调用方要等下一次循环才看得到它。
+        """
         end = time.time() + timeout
         while True:
             remain = end - time.time()
             if remain <= 0:
                 break
-            self.ser.timeout = min(remain, 0.05)
-            chunk = self.ser.read(256)
-            if not chunk:
-                continue
-            for b in chunk:
-                self._feed(b)
+
+            n = self.ser.in_waiting
+            if n:
+                chunk = self.ser.read(n)              # 立即返回，不等满
+            else:
+                self.ser.timeout = min(remain, 0.005)  # 没数据时才短暂等一下
+                chunk = self.ser.read(1)
+
+            if chunk:
+                for b in chunk:
+                    self._feed(b)
+                if self.frames:                        # 已经有帧了：别再耗时间
+                    break
+
         self._flush_text()
 
     def wait_frame(self, ftype: int, seq: int, timeout: float):
@@ -661,10 +685,7 @@ def cmd_selftest(dev, args):
     print("3) 组帧 / 解帧往返 + 坏帧丢弃")
     fake = Device.__new__(Device)
     fake.quiet = True
-    fake._in_frame = False
-    fake._buf = bytearray()
-    fake._text = bytearray()
-    fake.frames = []
+    fake._reset_parser()
     payload = struct.pack("<BHI", 7, 1024, 0xDEADBEEF)
     body = bytes([PROTO_VER, T_DATA | 0x80, 9]) + struct.pack("<H", len(payload)) + payload
     good = SYNC + body + struct.pack("<I", zlib.crc32(body) & 0xFFFFFFFF)
