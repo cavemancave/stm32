@@ -30,6 +30,7 @@
 #include "usart.h"
 #include "motor_io.h"
 #include "motor_ctrl.h"
+#include "power_mon.h"
 #include "uart_log.h"
 #include "ota_com.h"
 #include "ota_service.h"
@@ -79,10 +80,6 @@ const osTimerAttr_t motorPos_attributes = {
   .cb_size = sizeof(motorPosControlBlock),
 };
 
-/* 请求队列不在这里：它是收发层的东西，在 Device/Motor/motor_io.c 里
-   随串口一起建（MotorIo_Init）。所以 CubeMX 的 FreeRTOS 配置里
-   也不需要再配 motorQueue 了，别再加回来。 */
-
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 /* 启动路标：把“走到哪一步”和“还剩多少 FreeRTOS 堆”一起打出来（只在 Debug 构建里真的输出） */
@@ -124,6 +121,12 @@ void MX_FREERTOS_Init(void) {
   MotorIo_Init(&huart10);
   ota_boot_mark("H4: motor io (queue)");
 
+  /* 电源电压监测（PC4/ADC1_INP4）：开一个 1 Hz 的后台采样任务。
+     ADC 本体和自校准在 main() 里已经做过了（MX_ADC1_Init / PowerMon_Init），
+     这里只是把定时采样跑起来，并把第一次读数打进日志（此时 UartLog 已就绪）。 */
+  PowerMon_Start();
+  ota_boot_mark("H5: power monitor");
+
   /* USER CODE END Init */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -148,7 +151,10 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
-  /* 请求队列在 MotorIo_Init() 里建（见上面 USER CODE Init） */
+  /* ⚠ 请求队列不在这里：它是收发层的东西，在 Device/Motor/motor_io.c 里随串口一起建
+     （MotorIo_Init）。所以 CubeMX 的 FreeRTOS 配置里也不需要再配 motorQueue 了，
+     别再加回来。（这段原来写在文件上部、不在 USER CODE 区里，被 Generate Code
+     删过一次，现在挪进 USER CODE 区。） */
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */

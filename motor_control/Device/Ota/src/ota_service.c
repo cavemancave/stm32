@@ -24,7 +24,8 @@
 #include "uart_log.h"
 #include "ota_trace.h"
 #include "motor_ctrl.h"
-#include "motor_power.h"    /* 状态回帧里带上“电机电源是否使能” */
+#include "motor_power.h"    /* 状态回帧里带上"电机电源是否使能" */
+#include "power_mon.h"      /* 电源电压（PC4/ADC1_INP4）：ctrl vmon + 状态回帧末尾 */
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -214,7 +215,7 @@ static void OtaService_ConfirmBoot(void)
         /* ⚠ 千万别静默：这条写不进去，BL 下次就只能靠"向量表看着像 App"兜底，
            而且 A/B 切换 / 回滚 / 断点续传全部靠元数据 —— 失败必须看得见 */
         (void)snprintf(line, sizeof(line),
-                       "ota: boot confirm FAILED (st=%d)：元数据没写进去\r\n",
+                       "ota: boot confirm FAILED (st=%d): metadata not written\r\n",
                        (int)st);
         UartLog_Print(line);
     }
@@ -224,12 +225,42 @@ static void OtaService_ConfirmBoot(void)
 
 static void OtaService_Ctrl(uint8_t seq, const uint8_t *pl, uint16_t len)
 {
-    uint8_t  rsp[5];
-    uint32_t out = 0U;
+    uint8_t  rsp[13];       /* status(1) + data(4) + data2(4) + data3(4)：见 ota_layout.h */
+    uint32_t out  = 0U;
+    uint32_t out2 = 0U;
+    uint32_t out3 = 0U;
 
     if (len < 5U)
     {
         rsp[0] = (uint8_t)OTA_E_PARAM;
+    }
+    else if (pl[0] == OTA_CTRL_VMON)
+    {
+        /* 电源电压（PC4/ADC1_INP4）：这**不是电机的命令**，所以在进
+           MotorCtrl_RemoteCmd 之前就处理掉 —— 好处是升级中、电机已失能、
+           甚至 OTA 模式下都能问电压。
+           值取的是 power_mon 后台任务（1 Hz）的缓存，不在这里现采：
+           ADC 只有一套寄存器状态，两处同时采会互相踩（见 power_mon.h）。 */
+        if (PowerMon_Ok() == 0U)
+        {
+            rsp[0] = (uint8_t)OTA_E_STATE;      /* 还没采到 / 采样失败 */
+        }
+        else
+        {
+            rsp[0] = (uint8_t)OTA_OK;
+            out    = PowerMon_GetMv();          /* data  = 总压 mV */
+            out2   = PowerMon_GetCells();       /* data2 = 电池串数（单片电压由上位机换算） */
+            out3   = PowerMon_GetPercent();     /* data3 = 剩余百分比（按单片电压估，0xFF=无效） */
+        }
+    }
+    else if (pl[0] == OTA_CTRL_CELLS)
+    {
+        /* 电池串数（1..12）：6 = 6S 电池、3 = 12V 那套。不是电机命令，同样在这里处理。 */
+        PowerMon_SetCells((uint8_t)Ota_GetLe32(&pl[1]));
+
+        rsp[0] = (uint8_t)OTA_OK;
+        out    = PowerMon_GetCells();
+        out2   = out;
     }
     else
     {
@@ -241,9 +272,11 @@ static void OtaService_Ctrl(uint8_t seq, const uint8_t *pl, uint16_t len)
     }
 
     Ota_PutLe32(&rsp[1], out);
+    Ota_PutLe32(&rsp[5], out2);
+    Ota_PutLe32(&rsp[9], out3);
 
     UartLog_Lock();
-    OtaLink_Send((uint8_t)(OTA_T_CTRL | 0x80U), seq, rsp, 5U);
+    OtaLink_Send((uint8_t)(OTA_T_CTRL | 0x80U), seq, rsp, 13U);
     UartLog_Unlock();
 }
 
@@ -253,8 +286,9 @@ static void OtaService_Status(uint8_t seq, const uint8_t *pl, uint16_t len)
     uint16_t position = 0U;
     uint8_t  fault    = 0U;
     uint8_t  mode     = 0U;
-    uint8_t  rsp[10];
+    uint8_t  rsp[15];
     uint8_t  status;
+    uint32_t mv       = PowerMon_GetMv();
 
     /* payload（可选）= motor(1)：电机序号（1 起；不填 = 1 号机）。回帧布局不变，
        所以老上位机照样能读；要看第二台就再发一帧带序号的。 */
@@ -269,8 +303,17 @@ static void OtaService_Status(uint8_t seq, const uint8_t *pl, uint16_t len)
     rsp[8] = mode;
     rsp[9] = MotorPwr_IsOn();     /* 电机电源（PC14）：0 = 已断电 / 1 = 已使能 */
 
+    /* 电源电压 mV（PC4 分压取样）：**追加**在回帧末尾，同样向后兼容 ——
+       老上位机只读前 10 字节。量程 36 V 左右，u16 装得下（超了夹到顶）。 */
+    Ota_PutLe16(&rsp[10], (uint16_t)((mv > 0xFFFFU) ? 0xFFFFU : mv));
+    rsp[12] = PowerMon_GetCells();           /* 电池串数（单片电压 = 总压 / 串数） */
+    rsp[13] = (uint8_t)((PowerMon_Low()  ? 0x01U : 0x00U) |    /* bit0 低压 */
+                        (PowerMon_High() ? 0x02U : 0x00U) |    /* bit1 过压 */
+                        (PowerMon_Ok()   ? 0x00U : 0x04U));    /* bit2 读数无效 */
+    rsp[14] = PowerMon_GetPercent();         /* 剩余百分比 0..100（0xFF = 读数无效） */
+
     UartLog_Lock();
-    OtaLink_Send((uint8_t)(OTA_T_STATUS | 0x80U), seq, rsp, 10U);
+    OtaLink_Send((uint8_t)(OTA_T_STATUS | 0x80U), seq, rsp, 15U);
     UartLog_Unlock();
 }
 

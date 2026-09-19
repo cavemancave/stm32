@@ -199,27 +199,27 @@ static void ota_trace_fault_hints(uint32_t cfsr)
 {
     if ((cfsr & 0x00000200U) != 0U)      /* BFSR.PRECISERR */
     {
-        ota_trace_raw_text("\r\n  → 精确总线错误：BFAR 就是出错的那次访问地址");
+        ota_trace_raw_text("\r\n  -> precise bus error: BFAR is the faulting address");
     }
 
     if ((cfsr & 0x00000400U) != 0U)      /* BFSR.IMPRECISERR */
     {
-        ota_trace_raw_text("\r\n  → 非精确总线错误（写缓冲里的访问，BFAR 不可信）");
+        ota_trace_raw_text("\r\n  -> imprecise bus error (write buffer, BFAR not reliable)");
     }
 
     if ((cfsr & 0x00010000U) != 0U)      /* UFSR.UNDEFINSTR */
     {
-        ota_trace_raw_text("\r\n  → 取到了非法指令：PC 多半是跳飞了（函数指针/返回地址被改坏）");
+        ota_trace_raw_text("\r\n  -> invalid instruction: PC ran away (bad fn pointer / return addr)");
     }
 
     if ((cfsr & 0x00040000U) != 0U)      /* UFSR.INVPC */
     {
-        ota_trace_raw_text("\r\n  → EXC_RETURN 不对：多半是栈被写坏了");
+        ota_trace_raw_text("\r\n  -> bad EXC_RETURN: the stack is most likely corrupted");
     }
 
     if ((cfsr & 0x01000000U) != 0U)      /* UFSR.UNALIGNED */
     {
-        ota_trace_raw_text("\r\n  → 非对齐访问：uint32_t*/结构体指针强转最容易中招");
+        ota_trace_raw_text("\r\n  -> unaligned access: a cast to uint32_t*/struct pointer is the usual suspect");
     }
 }
 
@@ -267,18 +267,18 @@ void OtaTrace_Fault(const char *tag, uint32_t frame_sp, uint32_t exc_lr)
     ota_trace_raw_text(" BFAR=");
     ota_trace_raw_hex32(SCB->BFAR);
 
-    ota_trace_raw_text("\r\n  出错时在");
-    ota_trace_raw_text(((exc_lr & 0x4U) != 0U) ? "任务里 (PSP)" : "中断/handler 里 (MSP)");
+    ota_trace_raw_text("\r\n  fault in ");
+    ota_trace_raw_text(((exc_lr & 0x4U) != 0U) ? "task (PSP)" : "handler/ISR (MSP)");
     ota_trace_raw_text(" EXC_RETURN=");
     ota_trace_raw_hex32(exc_lr);
-    ota_trace_raw_text(" 帧@");
+    ota_trace_raw_text(" frame@");
     ota_trace_raw_hex32(frame_sp);
 
     ota_trace_fault_hints(SCB->CFSR);
 
     if ((ota_trace_sp_ok(frame_sp) == 0U) || (ota_trace_frame_ok(f) == 0U))
     {
-        ota_trace_raw_text("\r\n  (栈上不是异常帧，寄存器略：CFSR/BFAR 已经够定位了)\r\n");
+        ota_trace_raw_text("\r\n  (no exception frame on stack, registers skipped - CFSR/BFAR above is enough)\r\n");
         return;
     }
 
@@ -292,11 +292,11 @@ void OtaTrace_Fault(const char *tag, uint32_t frame_sp, uint32_t exc_lr)
     ota_trace_raw_hex32(f[3]);
     ota_trace_raw_text(" R12=");
     ota_trace_raw_hex32(f[4]);
-    ota_trace_raw_text("\r\n  PC(出错处)=");
+    ota_trace_raw_text("\r\n  PC(fault)=");
     ota_trace_raw_hex32(f[6]);
-    ota_trace_raw_text(" LR(调用者)=");
+    ota_trace_raw_text(" LR(caller)=");
     ota_trace_raw_hex32(f[5]);
-    ota_trace_raw_text("\r\n  反查：arm-none-eabi-addr2line -f -C -e build/Debug/motor_control.elf <PC> <LR>\r\n");
+    ota_trace_raw_text("\r\n  lookup: arm-none-eabi-addr2line -f -C -e build/Debug/motor_control.elf <PC> <LR>\r\n");
 }
 
 void OtaTrace_AssertFailed(const char *file, int line, const char *expr)

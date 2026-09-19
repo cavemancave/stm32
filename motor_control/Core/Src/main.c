@@ -20,6 +20,7 @@
 #include "main.h"
 #include "FreeRTOS.h"
 #include "cmsis_os2.h"
+#include "adc.h"
 #include "dma.h"
 #include "spi.h"
 #include "usart.h"
@@ -30,6 +31,7 @@
 #include "BMI088driver.h"
 #include "ws2812.h"
 #include "motor_power.h"    /* 电机电源开关（PC14 可控电源输出，高电平使能） */
+#include "power_mon.h"       /* 电源电压监测（PC4/ADC1_INP4，分压取样） */
 #include "ota_layout.h"      /* OTA_APP_BASE：本镜像链接在哪个槽（见 STM32H723xG_slots.ld） */
 #include "ota_trace.h"       /* 启动诊断（Debug 构建才输出，Release 里是空函数） */
 /* USER CODE END Includes */
@@ -175,7 +177,7 @@ int main(void)
   MX_SPI2_Init();
   MX_SPI6_Init();
   MX_USART10_UART_Init();
-
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
   /* 五个外设的 HAL 初始化都过了；下一个可能卡死的是 HAL_Delay（要 TIM6 中断） */
@@ -188,6 +190,11 @@ int main(void)
      PC14 这路给电机（及其驱动板）。 */
   MotorPwr_Init();
 
+  /* 电源电压监测（PC4 = ADC1_INP4）：ADC 本体已经在上面 MX_ADC1_Init() 里配好
+     （16 位、通道 4、387.5 周期、ADC 时钟 = PLL2 48 MHz），这里做自校准 + 取第一次值，
+     免得第一个上位机查询回来还是个 0。日志在 PowerMon_Start()（那边 UartLog 已经好了）。 */
+  PowerMon_Init();
+
   /* 使能可控 5V：板载 WS2812 指示灯由这一路供电，上电默认是关的 */
   HAL_GPIO_WritePin(Power_5V_EN_GPIO_Port, Power_5V_EN_Pin, GPIO_PIN_SET);
 
@@ -197,7 +204,7 @@ int main(void)
   /* 5V 有了再发一帧全灭：MCU 单独复位时灯珠会保留上一次的颜色 */
   WS2812_Ctrl(0U, 0U, 0U);
 
-  OtaTrace_Text("[app] F: 5V on + WS2812 ok (HAL_Delay 也过了)\r\n");
+  OtaTrace_Text("[app] F: 5V on + WS2812 ok (HAL_Delay too)\r\n");
 
   /* ⚠ 电机挂在 USART10 上：PE2 = RX、PE3 = TX，38400 8N1（见 usart.c）。
      PE3 (TX) 必须是开漏 (GPIO_MODE_AF_OD)：电机控制板是 5V TTL 单总线，

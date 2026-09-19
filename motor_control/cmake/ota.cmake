@@ -77,7 +77,7 @@ add_library(ota_service OBJECT
 )
 
 target_include_directories(ota_service PUBLIC ${OTA_DIR}/inc)
-target_link_libraries(ota_service PUBLIC ota_core motor_ctrl uart_log stm32cubemx)
+target_link_libraries(ota_service PUBLIC ota_core motor_ctrl uart_log power_mon stm32cubemx)
 
 # motor_ctrl.c 里的"无线控制入口"（MotorCtrl_RemoteCmd）用的就是 OTA 协议的
 # 命令码/状态码（ota_layout.h），而 motor_ctrl 目标在 ota.cmake 之前就建好了，
@@ -109,6 +109,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}_slotB
     motor
     motor_ctrl
     uart_log
+    power_mon
 )
 
 ota_apply_slot(${CMAKE_PROJECT_NAME}_slotB 0x08080000 0x60000)

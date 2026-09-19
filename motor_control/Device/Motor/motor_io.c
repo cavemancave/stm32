@@ -122,8 +122,8 @@ static void MotorIo_WarnDirtyRx(uint16_t flushed)
     hex[k] = '\0';
 
     (void)snprintf(line, sizeof(line),
-                   "[motor] ⚠ 电机串口 RX 一直在收数据（清了 %u 字节，前 %u 字: %s）\r\n"
-                   "        线被拉低 / 电机没上电 / 波特率不对 —— 已放弃清理继续启动，不会卡在这里\r\n",
+                   "[motor] WARN: motor UART RX keeps receiving (flushed %u bytes, first %u: %s)\r\n"
+                   "[motor]       RX stuck low / motor unpowered / wrong baud - flush dropped, boot continues\r\n",
                    (unsigned)flushed, (unsigned)s_flush_sniff_len, hex);
     UartLog_Print(line);
 }

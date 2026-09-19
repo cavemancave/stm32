@@ -86,13 +86,20 @@ CTRL = {
     "disable": 0x00, "enable": 0x01, "posloop": 0x02, "movepos": 0x03,
     "movedeg": 0x04, "stop": 0x05, "mute": 0x06, "pause": 0x07,
     "pwr": 0x08,          # 电机电源（PC14）：--arg 0=断电 1=上电 2=断电重启
+    "vmon": 0x09,         # 读电源电压（PC4/ADC1_INP4 分压取样）：data = 总压 mV
+    "cells": 0x0A,        # 设置电池串数（1..8，算“单片电压”用）
 }
 
 # 带固定参数的快捷命令：名字 → (cmd, arg)。想手动指定就再加 --arg。
 #   pwron   = 上电（设备会等 500 ms 让电源轨稳定）
 #   pwoff   = 断电
 #   pwcycle = 断电重启（电机状态卡死时用得上）
-CTRL_ARG = {"pwron": (0x08, 1), "pwoff": (0x08, 0), "pwcycle": (0x08, 2)}
+#   6s      = 6S 锂聚合物电池（现场那套；单片窗口 3.30~4.25 V ⇒ 19.8~25.5 V）
+#   3s/12v  = 12 V 那套：统一当 3S 算（12.0 V ⇒ 4.00 V/片，不会误报低压）
+CTRL_ARG = {
+    "pwron": (0x08, 1), "pwoff": (0x08, 0), "pwcycle": (0x08, 2),
+    "6s": (0x0A, 6), "3s": (0x0A, 3), "12v": (0x0A, 3),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +172,7 @@ class Device:
         self.ser = serial.Serial(port, baud, timeout=0.02)
         self.quiet = quiet
         self.seq = 0
+        self.rx_total = 0               # 一共收到多少字节（=0 基本就是波特率/模块问题）
         self._in_frame = False          # False = 正在看文本；True = 攒帧
         self._buf = bytearray()
         self._text = bytearray()
@@ -188,6 +196,8 @@ class Device:
         return seq
 
     def _feed(self, b: int):
+        self.rx_total += 1
+
         if b == 0x00:
             if self._in_frame:
                 self._try_frame(bytes(self._buf))
@@ -550,21 +560,46 @@ def cmd_status(dev: Device, args):
     """默认把总线上每一台都问一遍；--motor N 就只问那一台。"""
     motors = [args.motor] if args.motor else list(range(1, N_MOTORS + 1))
     pwr_note = ""
+    volt_note = ""
 
     for mi in motors:
         rsp = dev.request(T_STATUS, bytes([mi]), timeout=3.0, retries=3)
         if rsp is None:
             raise OtaError("STATUS 没有回复（设备在跑吗）")
-        if rsp[0] != ST_OK:
-            print(f"  电机{mi}: 没答上（{ST_TEXT.get(rsp[0], rsp[0])}）"
-                  f"—— 没上电 / 没接线 / ID 不是 {mi}？")
-            continue
-        # 电机电源（PC14）是后加到回帧末尾的：老固件没这一字节，所以判一下长度
+
+        # 电机电源（PC14）和电源电压都是后加到回帧末尾的：老固件没这些字节，
+        # 所以判长度再打印（新固件：... mode(8) pwr(9) vmv(10..11) cells(12) flags(13)）
+        # ⚠ 这两项**跟电机没关系**，所以要在"电机答没答上"之前就取出来：
+        #   电机没上电（比如刚升级完，OTA 把 PC14 切了）时也该看得到电压。
         if (not pwr_note) and len(rsp) > 9:
             pwr_note = f"  电机电源={'ON' if rsp[9] else 'OFF'}"
+        if (not volt_note) and len(rsp) > 11:
+            mv = u16(rsp, 10)
+            cells = rsp[12] if len(rsp) > 12 else 0
+            flags = rsp[13] if len(rsp) > 13 else 0
+            note = f"  电源电压={mv / 1000.0:.2f}V"
+            pct = rsp[14] if len(rsp) > 14 else 0xFF
+            if cells:
+                note += f"（{cells}S，单片 {mv / cells / 1000.0:.2f}V"
+                if pct <= 100:
+                    note += f"，剩余≈{pct}%"
+                if flags & 1:
+                    note += "，⚠低压"
+                elif flags & 2:
+                    note += "，⚠过压"
+                note += "）"
+            if flags & 4:
+                note += " ⚠读数无效"
+            volt_note = note
+
+        if rsp[0] != ST_OK:
+            print(f"  电机{mi}: 没答上（{ST_TEXT.get(rsp[0], rsp[0])}）"
+                  f"—— 没上电 / 没接线 / ID 不是 {mi}？{pwr_note}{volt_note}")
+            continue
+
         print(f"  电机{mi}: 里程={i32(rsp, 1)} 圈  位置={u16(rsp, 5)}"
               f"（{u16(rsp, 5) * 360.0 / 32768:.1f}°）  故障码=0x{rsp[7]:02X}"
-              f"  模式=0x{rsp[8]:02X}{pwr_note}")
+              f"  模式=0x{rsp[8]:02X}{pwr_note}{volt_note}")
 
 
 def cmd_ctrl(dev: Device, args):
@@ -585,10 +620,22 @@ def cmd_ctrl(dev: Device, args):
     rsp = dev.request(T_CTRL, payload, timeout=15.0, retries=2)
     if rsp is None:
         raise OtaError(f"{args.cmd} 没有回复（使能会重试约 5 s，再等等）")
-    pwr = ""
+    data = u32(rsp, 1)
+    data2 = u32(rsp, 5) if len(rsp) > 8 else 0   # 后加的第二个字段，老固件没有
+    data3 = u32(rsp, 9) if len(rsp) > 12 else 0  # 第三个（目前只有 vmon 用：剩余百分比）
+    extra = ""
     if cmd == 0x08:                     # 电源命令：data 返回当前状态（0/1）
-        pwr = f"  电机电源={'ON' if u32(rsp, 1) else 'OFF'}"
-    print(f"{args.cmd}({arg}){who} → {ST_TEXT.get(rsp[0], rsp[0])}  data={u32(rsp, 1)}{pwr}")
+        extra = f"  电机电源={'ON' if data else 'OFF'}"
+    elif cmd == 0x09:                   # 电压命令：data = 总压 mV，data2 = 串数，data3 = 剩余%
+        extra = f"  电源电压={data / 1000.0:.2f}V"
+        if data2:
+            extra += f"  单片={data / data2 / 1000.0:.2f}V（{data2}S）"
+        if data3 <= 100:
+            extra += f"  剩余≈{data3}%"
+    elif cmd == 0x0A:                   # 串数命令：data2 = 生效后的串数
+        cells = data2 or data
+        extra = (f"  已按 {cells}S 算（单片窗口 {cells * 3.30:.2f}~{cells * 4.25:.2f}V）")
+    print(f"{args.cmd}({arg}){who} → {ST_TEXT.get(rsp[0], rsp[0])}  data={data}{extra}")
 
 
 def cmd_console(dev: Device, args):
@@ -659,7 +706,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     ap.add_argument("--port", help="电脑这边的配对串口，如 COM7 或 /dev/ttyUSB0（selftest 不需要）")
-    ap.add_argument("--baud", type=int, default=115200, help="默认 115200，要和固件 OTA_PORT_BAUD 一致")
+    ap.add_argument("--baud", type=int, default=115200,
+                    help="默认 115200（= 固件 OTA_PORT_BAUD）；要和模块、固件都一致。"
+                         "固件改成 921600 后这里也要跟（模块同样要改）")
     ap.add_argument("-q", "--quiet", action="store_true", help="不要把设备日志打到屏幕上")
 
     sub = ap.add_subparsers(dest="action", required=True)
@@ -667,7 +716,8 @@ def main():
     # flash / upgrade 共用的参数（upgrade 只是"文件可以不填"）
     flash_args = argparse.ArgumentParser(add_help=False)
     flash_args.add_argument("--slot", default="auto", help="auto（默认，写非活动槽）/ A / B")
-    flash_args.add_argument("--chunk", type=int, default=1024, help="每包字节数，默认 1024")
+    flash_args.add_argument("--chunk", type=int, default=4096,
+                            help="每包字节数，默认 4096（取 min(设备上报的, 这个值)，不会超过设备上限）")
     flash_args.add_argument("--retries", type=int, default=5, help="每一包的重传次数")
     flash_args.add_argument("--force", action="store_true", help="强制重新擦除，不续传")
     flash_args.add_argument("--version", type=lambda s: int(s, 0), default=None,
@@ -705,11 +755,13 @@ def main():
     p.add_argument("--boot", action="store_true", help="重启进 Bootloader 恢复台（救砖用）")
     p.set_defaults(func=cmd_reboot)
 
-    p = sub.add_parser("ctrl", help="控制电机（不用 OTA 时这个口就是干这个的）")
+    p = sub.add_parser("ctrl", help="控制电机 / 读电源电压（不用 OTA 时这个口就是干这个的）")
     p.add_argument("cmd", choices=sorted(CTRL.keys()) + sorted(CTRL_ARG.keys()),
-                   help="disable/enable/posloop/movepos/movedeg/stop/mute/pause/pwr/pwron/pwoff/pwcycle")
+                   help="disable/enable/posloop/movepos/movedeg/stop/mute/pause/pwr/vmon/cells"
+                        "/pwron/pwoff/pwcycle/6s/3s/12v")
     p.add_argument("arg", nargs="?", type=lambda s: int(s, 0), default=None,
-                   help="参数：movepos=0..32767、movedeg=0..359、mute/pause=0/1、pwr=0/1/2")
+                   help="参数：movepos=0..32767、movedeg=0..359、mute/pause=0/1、pwr=0/1/2、"
+                        "cells=1..8（vmon 不用）")
     p.add_argument("--motor", type=int, default=0,
                    help=f"作用于哪一台（1..{N_MOTORS}）；不填 = 设备默认"
                         f"（失能/急停管全部，使能/走位管 1 号机）")
@@ -730,6 +782,13 @@ def main():
         args.func(dev, args)
     except OtaError as e:
         print(f"\n❌ {e}", file=sys.stderr)
+        # 一个字节都没收到：比“设备没在跑”更常见的原因是波特率 / 模块不对
+        if dev.rx_total == 0:
+            print(f"   {args.port} @{args.baud} 一个字节都没收到，优先查：\n"
+                  f"     1) 波特率：固件是 921600，模块的串口波特率也要改成 921600；"
+                  f"设备停在 BL 里时是 115200 → 试 `--baud 115200`\n"
+                  f"     2) 模块有没有配对/上电、串口号对不对（设备管理器里看一眼）",
+                  file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print()

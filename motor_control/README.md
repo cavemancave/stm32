@@ -101,7 +101,7 @@ CMake 片段和驱动一样按仓库惯例用 `include()` 从根 `CMakeLists.txt
 | 后续④：失能 | 来回走的时候再按一下键 → 发 `0xA0/0x09`（`Motor_Disable`）失能每台电机，把回帧的 `mode` 也打出来，然后回到等按键。失能只是「不使劲」，通信还在，所以 `motorPoll` 那一路的 0x74 轮询照旧 |
 | 状态轮询 | 定时器每 **200 ms**（`MOTOR_CTRL_POLL_MS`）唤醒 `MotorCtrl_PollTask`，查一轮 `0x74`（等 `0x75`），打印**里程圈数、位置原始值（并换算成 0.1°）、故障码（按位译成 hall/overcurrent/stall/overtemp/link-loss/voltage，未知位写 other）** |
 | 灯 | 只由 `MotorCtrl_Task` **一个**任务点（WS2812 走 SPI6，两个任务同时点会把帧打断）。每次点灯从枚举里**依次**取一个颜色（`RED → GREEN → BLUE → YELLOW → CYAN → MAGENTA → WHITE → RED`，跳过 `OFF`）：上电红 → 按键后绿 → 之后由「每走一步换一个颜色」当心跳；**失能时直接点 `OFF`（灭）**，看到灯灭就知道电机不使劲了（再按键使能时接着按枚举换下一个颜色）。亮度不在业务里设，用驱动默认 `WS2812_DEFAULT_BRIGHTNESS = 32`（含义是 R+G+B 之和；要调就改 `ws2812.h` 那个宏或开机调 `WS2812_SetBrightness()`），所以 红/绿/蓝 分别是 `(32,0,0)`、`(0,32,0)`、`(0,0,32)` |
-| 日志 | 打在 **无线口 USART1**（115200）上，同时镜像到 UART7，见「无线 OTA 升级」和「串口输出」两节 |
+| 日志 | 打在 **无线口 USART1**（921600）上，同时镜像到 UART7，见「无线 OTA 升级」和「串口输出」两节 |
 
 帧格式：`ID | 功能码 | DATA[2..8] | CRC8`
 
@@ -167,6 +167,8 @@ CMake 片段和驱动一样按仓库惯例用 `include()` 从根 `CMakeLists.txt
 | BL 恢复台 + 超时兜底 | `reboot --boot` → `flags=0x81`、`info` 提示"设备正在 Bootloader 恢复台"；15 s 不动自动尝试启动 |
 | 两台电机（同总线 ID1/ID2） | `status` 两台都有回复；`ctrl movepos … --motor 2` 能让 2 号机动作 |
 | 电机电源开关（PC14） | 上电默认关断；按键/`ctrl enable` 先上电并等 500 ms 再发使能帧 |
+| 电源电压监测（PC4/ADC1_INP4） | Boot 打 `[power] VCC_IN = 23.88V (ADC1_INP4/PC4 raw=43118, 分压 11:1, VREF=3300 mV, 单片 3.98V / 6S)`；`ctrl vmon` → 23881 mV；`status` 末尾带电压/单片（**电机没答上也打印**）；`ctrl 12v` → 过压告警、`ctrl 6s` → "恢复正常"；`ctrl cells 12` 被夹到 8 |
+| 无线升级（同一天又刷 4 次） | A↔B 往返刷了 4 次（含改代码后重新构建的），每次都 `校验通过` → 切槽 → `启动计数 0/3` |
 | 断点续传 / 坏包拒绝 | ⬜ **还没单独实测**（设计如此：进度 32 KB 落盘；`END` 用读回 CRC32 把关，不过就 不提交） |
 
 ### Flash 怎么分的、为什么不会变砖
@@ -229,11 +231,14 @@ python tools/ota.py --port COM7 flash build/Debug/motor_control_slotB.bin
 python tools/ota.py --port COM7 rollback                   # 新固件有问题 → 一键切回旧槽
 python tools/ota.py --port COM7 reboot --boot              # 手动进 Bootloader 恢复台（救砖）
 python tools/ota.py --port COM7 monitor                    # 当串口监视器看日志
-python tools/ota.py --port COM7 status                     # 电机里程/位置/故障码 + 电源状态
+python tools/ota.py --port COM7 status                     # 电机里程/位置/故障码 + 电源状态 + 电压
 python tools/ota.py --port COM7 ctrl disable               # 电机失能（enable/posloop/movepos/... 同理）
 python tools/ota.py --port COM7 ctrl pwron                 # 电机电源上电（PC14 拉高）
 python tools/ota.py --port COM7 ctrl pwoff                 # 电机电源断电
 python tools/ota.py --port COM7 ctrl pwcycle               # 断电重启电机（状态卡死时用）
+python tools/ota.py --port COM7 ctrl vmon                  # 读电源电压（总压 + 单片）
+python tools/ota.py --port COM7 ctrl 6s                    # 按 6S 算单片（现场那套电池）
+python tools/ota.py --port COM7 ctrl 12v                   # 按 3S 算单片（12V 开关电源那套）
 ```
 
 `flash` 会自动挑槽（写在非活动槽）并**检查你给的 .bin 是给哪个槽编的**
@@ -313,7 +318,7 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
    根 `CMakeLists.txt` 只在**第一次**生成，之后的用户改动不会被覆盖。
 2. 自己新增的驱动**不要**直接写进生成文件，统一走「独立 cmake 片段」模式：
    - 配置放在 `cmake/bmi088.cmake`、`cmake/ws2812.cmake`、`cmake/motor.cmake`、
-     `cmake/motor_ctrl.cmake`、`cmake/uart_log.cmake`、`cmake/ota.cmake`
+     `cmake/motor_ctrl.cmake`、`cmake/uart_log.cmake`、`cmake/power_mon.cmake`、`cmake/ota.cmake`
      （CubeMX 不认这些文件，永远不会被覆盖）
    - 由根 `CMakeLists.txt` 里的几行 `include(cmake/xxx.cmake)` 拉进来
    - ⚠ **请求队列不在 CubeMX 里**：`Device/Motor/motor_io.c` 自己用 `xQueueCreate()` 建。
@@ -342,6 +347,9 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
    `STM32H723xG_slots.ld` 里那几行 `MEMORY` 就行。
 7. **不要**在 CubeMX 里勾 USART1（原因见「无线 OTA 升级」一节最后）。引脚清单里
    PA9/PA10 应该一直是“未分配”。
+   ⚠ 反例：**ADC1 / PC4 是勾在 CubeMX 里的**（`Core/Src/adc.c` 由它生成，含 PLL2 = 48 MHz
+   的 ADC 时钟、16 位分辨率、387.5 周期采样、PC4 模拟模式）。重新生成之后别把 ADC1 取消了，
+   也**不要把采样时间改短**（源阻抗 ≈ 91 kΩ，见 `Device/Power/power_mon.h`）。
 8. 升级/分区相关的动态都在 `USER CODE` 段里：`Core/Src/main.c` 只多一行 `SCB->VTOR = OTA_APP_BASE;`
    （**必须在 `MPU_Config()` 之前**），`Core/Src/freertos.c` 里只改了日志口和加上 OTA 服务初始化。
 
@@ -356,7 +364,8 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
 | SPI2：SCK / MOSI / MISO | PB13 / PC1 / PC2_C |
 | SPI2 中断：ACC_INT / GYRO_INT | PE10 / PE12 |
 | UART7（调试日志镜像，115200） | PE7 (RX) / PE8 (TX) |
-| **USART1（无线串口：日志 + 控制 + OTA，115200）** | **PA9 = TX / PA10 = RX**（AF7，模块侧标 UART0） |
+| **USART1（无线串口：日志 + 控制 + OTA，921600）** | **PA9 = TX / PA10 = RX**（AF7，模块侧标 UART0） |
+| **电源电压采集（`ADC1_INP4`）** | **PC4**（VCC_IN → R86 1 MΩ → PC4 → R87 100 kΩ → GND，分压比 11:1；C53 10 nF 滤波） |
 | USART10（电机，38400） | PE2 (RX) / PE3 (TX)，AF4 / AF11；**PE3 是开漏 AF_OD**（电机板 5V TTL，推挽会误发信号）。**两台电机挂同一条总线**，靠帧里的 ID 区分（ID1 / ID2） |
 | 板载 WS2812：DIN | **PA7 = SPI6_MOSI** |
 
@@ -369,6 +378,25 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
   失能（含进 OTA 模式）时会把这一路一并切掉；无线侧可用 `ctrl pwron/pwoff/pwcycle` 控制。
   ⚠ PC14/PC15 是 **OSC32_IN / OSC32_OUT**（这板子没焊 32.768 kHz 晶振，才能当 GPIO 用），
   属于备份域、驱动能力很弱（几 mA），**只能当使能信号**，电流得电源那边出，别直接带负载。
+
+### 电源电压监测（PC4 = ADC1_INP4）
+
+VCC_IN（电机那一路电源）经 **R86 1 MΩ / R87 100 kΩ** 分压后进 PC4，所以
+**量程 = 3.3 V × 11 ≈ 36.3 V**，12 V 开关电源和 **6S 电池（满 25.2 V）** 都在里面。
+
+* 代码：`Device/Power/power_mon.c`（`PowerMon_Init/Start`，1 Hz 后台采样 + 状态跳变才打日志）；
+  ADC 本体（PLL2 = 48 MHz 时钟、16 位、387.5 周期采样）是 **CubeMX 生成**的 `Core/Src/adc.c`。
+* 无线读取：`ctrl vmon`（总压 mV + 电池串数）；`status` 回帧末尾也会带上电压和告警标志。
+* **“单片电压”只有一个旋钮：电池串数**（`ctrl cells N`，快捷写法 `ctrl 6s` / `ctrl 3s` / `ctrl 12v`）：
+  - 6S 电池 → `ctrl 6s`：单片窗口 3.30~4.25 V ⇒ 总压 19.8~25.5 V；
+  - 12 V 开关电源 → `ctrl 12v`（= 当 3S 算）：12.0 V ⇒ 4.00 V/片，落在窗口中间，不会误报；
+    真正的窗口是 9.9~12.75 V，对一个“12 V 电源 / 3S 电池”是合理的。
+  - 没有“不判单片”这种特例（有特例就得多一堆 `cells==0` 分支），串数存在 RAM 里，
+    上电默认 **6**。
+* 低于/高于单片窗口，或读数顶到量程上限（≥34 V 饱和）、采样失败，都会在串口打一条
+  `[power] ⚠ …`（只在**状态跳变**时打，不会一秒一条刷屏）。
+* ⚠ 精度取决于 VDDA/VREF+ 到底是不是 3.300 V（按它算的）；量程/换算对不上时先核对
+  R86/R87 和 VREF（`Device/Power/inc/power_mon.h` 里改宏即可）。
 
 ### 两台电机（同一条总线，靠 ID 区分）
 

@@ -82,16 +82,45 @@
 #define OTA_MAX_BOOT_ATTEMPTS     3U        /* 新固件连续 3 次没"确认"就判坏、回滚 */
 #define OTA_CONFIRM_DELAY_MS      2000U     /* App 跑够这么久才写"启动确认" */
 
-/* ---- 下载会话 ---- */
-#define OTA_CHUNK_MAX             1024U
-#define OTA_CHUNK_DEFAULT         1024U
+/* ---- 下载会话 ----
+   块大小是“链路速度”的主旋钮：每块都要等一个回复（一问一答），
+   实测每块的往返延迟 ~140 ms，而且几乎和块大小无关 ⇒ 块越大吞吐越高。
+   1024 → 4096 把往返次数除以 4。
+   ⚠ 上限受两个东西约束：
+     1) `OTA_PORT_RX_RING` 得装得下一整个编码后的帧（见下面的备注）；
+     2) `OTA_LINK_*_MAX` 那几个静态缓冲会跟着涨（.bss，不吃 FreeRTOS 堆）。 */
+#define OTA_CHUNK_MAX             4096U
+#define OTA_CHUNK_DEFAULT         4096U
 #define OTA_DL_SAVE_STEP          (32U * 1024U)   /* 每写这么多就落一次盘（续传用） */
 #define OTA_SESSION_TIMEOUT_MS    30000U          /* 这么久没收到帧就放弃这次会话 */
 
-/* ---- 无线口 ---- */
-#define OTA_PORT_BAUD             115200U   /* 两边要一致；模块支持的话可以调更高 */
-#define OTA_PORT_RX_RING          2048U     /* 软件环形缓冲（硬件还有 16 字节 FIFO） */
+/* ---- 无线口 ----
+   默认 115200（和模块出厂设置一致，最不容易把自己关在门外）。
+   想上 **921600（= ×8）**的话，**三件事必须一起改**，缺一件就是“设备听不见”：
+     1) 这里改成 921600U、重新构建、烧进去（`tools/ota.py` 的默认值已经是 921600）；
+     2) **电机侧 + PC 侧两个模块**的“串口波特率”都改成 921600（用模块的配置工具）；
+     3) 发固件那一次仍然要用 `--baud 115200`（那会儿设备跑的还是旧固件=旧波特率）。
+   H7 这边没精度问题：USART1 走 D2PCLK2 = 120 MHz，16 倍过采样下
+   USARTDIV = 130.2 → 实际 921748，误差 +0.02%。
+   ⚠ Bootloader **不参与 OTA**：没重烧 `motor_boot` 之前它一直是旧宏的波特率，
+     所以“升级完 BL 那几行 banner 是乱码”是正常的（App 的日志不受影响）；
+     要进 BL 恢复台就加 `--baud 115200`（或把 BL 也重烧一次）。
+   ⚠ 万一模块改不了/配错，App 会听不见（而 App 自己会照常确认启动、**不会**自动回滚），
+     那就没电了：只能按住 USER_KEY 上电进 BL 控制台（115200）把旧固件刷回去。
+   ⚠ 实测：115200 下只有 ~4.4 KB/s，而且瓶颈不在串口而在“每块的往返延迟”，
+     所以先动块大小（见上面 OTA_CHUNK_*），不要指望波特率 ×8 能快 8 倍。 */
+#define OTA_PORT_BAUD             115200
+/* ⚠ 上面故意**不带 U 后缀**：日志里是 OTA_STR(OTA_PORT_BAUD)，宏参数会被原样字符串化，
+   带后缀就会打出 "115200U"。（这个值只往 uint32_t 里赋，有没有 U 都一样） */
+#define OTA_PORT_RX_RING          8192U     /* 软件环形缓冲（硬件还有 16 字节 FIFO）。
+                                               必须 ≥ 一帧编码后的长度 + 2：
+                                               11 + (4 + CHUNK) 再乘 COBS 膨胀（+1/254），
+                                               4096 块 ≈ 4131 字节 */
 #define OTA_PORT_TX_TIMEOUT_MS    500U
+
+/* 把宏的数值变成字符串，给日志用：OTA_STR(OTA_PORT_BAUD) → "115200" */
+#define OTA_STR_INNER(x)          #x
+#define OTA_STR(x)                OTA_STR_INNER(x)
 
 /* ---- 协议版本/同步头/帧开销 ---- */
 #define OTA_PROTO_VER             0x01U
@@ -128,8 +157,23 @@ enum
     OTA_CTRL_STOP         = 0x05U,   /* 急停（0x64 给定值 = 0） */
     OTA_CTRL_LOG_MUTE     = 0x06U,   /* 静音/恢复日志：arg = 0/1 */
     OTA_CTRL_POLL_PAUSE   = 0x07U,   /* 暂停/恢复 200 ms 状态轮询：arg = 0/1 */
-    OTA_CTRL_PWR          = 0x08U    /* 电机电源（PC14 可控电源输出）：arg = 0 断电 / 1 上电 / 2 断电重启 */
+    OTA_CTRL_PWR          = 0x08U,   /* 电机电源（PC14 可控电源输出）：arg = 0 断电 / 1 上电 / 2 断电重启 */
+    OTA_CTRL_VMON         = 0x09U,   /* 读电源电压（PC4/ADC1_INP4 分压取样）：arg 保留（0），
+                                        回复 data = 总压 mV、data2 = 电池串数、data3 = 剩余百分比
+                                        （0..100，0xFF=无效）。
+                                        **不是电机命令**，所以升级/失能时也能问 */
+    OTA_CTRL_CELLS        = 0x0AU    /* 设置电池串数（算"单片电压"/百分比用，1..8）：arg = 串数，
+                                        回复 data = 生效后的串数。
+                                        6 = 6S 电池、3 = 12V 那套（当 3S 算），见 power_mon.h */
 };
+
+/* OTA_T_CTRL 回复的 payload 布局（13 字节）：
+ *   [0]     = OTA_OK / OTA_E_xxx（见下面状态码）
+ *   [1..4]  = data  （各命令自己定：状态值 / 电压 mV / 串数 ...）
+ *   [5..8]  = data2 （后加的第二个 32 位，用不上时为 0）
+ *   [9..12] = data3 （只用得上一个参数的命令在 data2 里传；再不够才动 data3，
+ *                    目前只有 vmon 用它（剩余百分比 0..100，0xFF=无效））
+ * ⚠ data2/data3 都只加在**后面**：老上位机（只读前 5 字节）照样能用。 */
 
 /* ---- 状态码：回复帧 payload[0] ---- */
 enum

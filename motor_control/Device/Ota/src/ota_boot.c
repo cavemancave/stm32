@@ -191,37 +191,36 @@ static void __attribute__((noreturn)) bl_fault(const char *tag)
 
     if (can_heal != 0U)
     {
-        bl_raw_text("\r\n  → 扇区 S");
+        bl_raw_text("\r\n  -> bad flash word in sector S");
         bl_raw_dec(sector);
-        bl_raw_text(" 里有坏掉的 flash word");
 
         if (*s_heal_count < BL_HEAL_MAX)
         {
             (*s_heal_count)++;
 
-            bl_raw_text("，正在擦掉它并复位（第 ");
+            bl_raw_text(", erasing it and resetting (attempt ");
             bl_raw_dec(*s_heal_count);
-            bl_raw_text("/3 次）...\r\n");
+            bl_raw_text("/3)...\r\n");
 
             st = OtaFlash_EraseSector(sector);
 
             if (st == OTA_OK)
             {
-                bl_raw_text("  → 擦除成功，复位后应该能正常启动\r\n");
+                bl_raw_text("  -> erase OK, it should boot after the reset\r\n");
                 NVIC_SystemReset();
             }
 
-            bl_raw_text("  → 擦除失败（st=");
+            bl_raw_text("  -> erase FAILED (st=");
             bl_raw_dec((uint32_t)(uint8_t)st);
-            bl_raw_text("），只能靠 ST-Link 全片擦除了\r\n");
+            bl_raw_text("), only a full-chip erase via ST-Link can fix it\r\n");
         }
         else
         {
-            bl_raw_text("，但自愈已经连续失败 3 次，不再折腾了\r\n");
+            bl_raw_text(", but self-heal already failed 3 times - giving up\r\n");
         }
     }
 
-    bl_raw_text("  → 停在 Bootloader（重新上电可再试）\r\n");
+    bl_raw_text("  -> staying in Bootloader (power-cycle to retry)\r\n");
 
     for (;;)
     {

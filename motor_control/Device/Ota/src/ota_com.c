@@ -73,7 +73,9 @@ static void OtaCom_HwInit(uint32_t baud)
         return;
     }
 
-    OtaTrace_Text("[ota_com] USART1 up (log + control + OTA)\r\n");
+    /* 把波特率也打出来：联调时“设备到底在多少波特率上”是最常怀疑的一件事 */
+    OtaTrace_Text("[ota_com] USART1 up @ " OTA_STR(OTA_PORT_BAUD)
+                  " 8N1 (log + control + OTA)\r\n");
 
     /* 16 字节 RX FIFO。threshold 设 1/8：FIFO 里攒到 2 个字节就中断，别等满了 */
     if (HAL_UARTEx_EnableFifoMode(&s_uart) == HAL_OK)

@@ -87,6 +87,8 @@ include(cmake/ws2812.cmake)
 include(cmake/uart_log.cmake)
 include(cmake/motor.cmake)
 include(cmake/motor_ctrl.cmake)
+# 电源电压监测（PC4/ADC1_INP4）；ADC 本体由 CubeMX 生成的 Core/Src/adc.c 提供
+include(cmake/power_mon.cmake)
 # 无线 OTA：ota_core/ota_service + 三个镜像目标（App-A / App-B / Bootloader）
 include(cmake/ota.cmake)
 
