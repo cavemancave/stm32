@@ -344,7 +344,7 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
 | SPI2 中断：ACC_INT / GYRO_INT | PE10 / PE12 |
 | UART7（调试日志镜像，115200） | PE7 (RX) / PE8 (TX) |
 | **USART1（无线串口：日志 + 控制 + OTA，115200）** | **PA9 = TX / PA10 = RX**（AF7，模块侧标 UART0） |
-| USART10（电机，38400） | PE2 (RX) / PE3 (TX)，AF4 / AF11；**PE3 是开漏 AF_OD**（电机板 5V TTL，推挽会误发信号） |
+| USART10（电机，38400） | PE2 (RX) / PE3 (TX)，AF4 / AF11；**PE3 是开漏 AF_OD**（电机板 5V TTL，推挽会误发信号）。**两台电机挂同一条总线**，靠帧里的 ID 区分（ID1 / ID2） |
 | 板载 WS2812：DIN | **PA7 = SPI6_MOSI** |
 
 - 5V 在 CubeMX 里上电默认是**关**的，`main()` 的 USER CODE 2 里才打开，等 100 ms
@@ -356,6 +356,31 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
   失能（含进 OTA 模式）时会把这一路一并切掉；无线侧可用 `ctrl pwron/pwoff/pwcycle` 控制。
   ⚠ PC14/PC15 是 **OSC32_IN / OSC32_OUT**（这板子没焊 32.768 kHz 晶振，才能当 GPIO 用），
   属于备份域、驱动能力很弱（几 mA），**只能当使能信号**，电流得电源那边出，别直接带负载。
+
+### 两台电机（同一条总线，靠 ID 区分）
+
+两台电机挂在**同一条 USART10 单总线**上（LIN 那种半双工），靠**帧里的 ID** 区分，最多两台：
+ID 是**上电时由电机的 ID 脚锁存**的（低 = ID1、高 = ID2），所以接线时把第二台的 ID 脚接高即可；
+两台**共用** PC14 那一路电机电源（VCC_OUT1_EN）。
+
+- 固件里就是 `Device/Motor/motor_ctrl.c` 的 `motor_ids[]`（`{1U, 2U}`）和 `MOTOR_COUNT`：
+  使能 / 失能 / 轮询都是按这个数组循环，两台都覆盖。
+- 无线命令用 `--motor` 指定哪一台。**不填**时按安全默认：失能/急停作用于**全部**、
+  使能/切位置环/走位作用于 **1 号机**（老的命令行行为不变）：
+
+  ```bash
+  python tools/ota.py --port COM7 status                          # 两台都问
+  python tools/ota.py --port COM7 ctrl enable  --motor 2          # 只使能 2 号机
+  python tools/ota.py --port COM7 ctrl posloop --motor 2          # 2 号机切位置环
+  python tools/ota.py --port COM7 ctrl movepos 8191 --motor 2     # 2 号机走 90°
+  python tools/ota.py --port COM7 ctrl disable --motor 2          # 只失能 2 号机（不切电源）
+  python tools/ota.py --port COM7 ctrl disable                    # 两台都失能 + 切电源
+  ```
+
+  ⚠ 单台失能**不会**切电源（另一台可能还在干活）；只有"失能全部"才断 PC14 那一路。
+- PA15 按键那套台架测试：按下后**两台**都会使能并切到位置环（都逐一复核 0x03），
+  但"走一圈"的测试**只跑 1 号机** —— 避免两台同时转、桌上撞在一起；
+  2 号机用上面的 `ctrl ... --motor 2` 单独测。
 - WS2812 不走普通 GPIO，而是用 SPI6 的 MOSI 波形模拟单总线：**1 个 SPI 字节 = 1 个数据位**
   （`0` → `0x60`，`1` → `0x78`），一帧 24 字节（G-R-B），之后补 ≥50 µs 低电平锁存。
   SPI6 内核时钟取 HSE 24 MHz，预分频 4 → 6 MHz。

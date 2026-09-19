@@ -39,8 +39,9 @@ extern osTimerId_t motorPosHandle;
 /* Private define ------------------------------------------------------------*/
 
 /* 挂在同一条串口上的电机台数（和下面 motor_ids[] 的元素个数要一致）
-   当前只测 1 台（ID1，ID 脚接地）；两台都挂上时改成 2U 并补全 motor_ids[] */
-#define MOTOR_COUNT                 1U
+   现在 2 台：ID1 + ID2，共用同一条 USART10 单总线、也共用 PC14 那一路电机电源。
+   ⚠ 达妙这颗的 ID 是**上电时锁存**的（ID 脚 低 = ID1 / 高 = ID2），所以一条总线最多两台。 */
+#define MOTOR_COUNT                 2U
 
 /* USER_KEY（PA15）消抖时间：按下后隔这么久再确认一次 */
 #define KEY_DEBOUNCE_MS             20U
@@ -137,8 +138,20 @@ extern osTimerId_t motorPosHandle;
 
 /* Private variables ---------------------------------------------------------*/
 
-/* 这条串口上挂的电机 ID，按顺序依次问（改这里的同时改 MOTOR_COUNT） */
-static const uint8_t motor_ids[MOTOR_COUNT] = { 1U };
+/* 这条串口上挂的电机 ID，按顺序依次问（改这里的同时改 MOTOR_COUNT）
+   顺序就是无线命令里的电机序号：1 = motor_ids[0]（总线 ID1）、2 = motor_ids[1]（ID2） */
+static const uint8_t motor_ids[MOTOR_COUNT] = { 1U, 2U };
+
+/* 无线命令里的"电机序号"（1 起）→ 总线 ID。序号越界返回 0（= 没有这台） */
+static uint8_t MotorCtrl_MotorIdOfIndex(uint8_t index)
+{
+    if ((index >= 1U) && (index <= MOTOR_COUNT))
+    {
+        return motor_ids[index - 1U];
+    }
+
+    return 0U;
+}
 
 static osSemaphoreId_t s_poll_sem  = NULL;
 static osThreadId_t    s_poll_task = NULL;
@@ -173,24 +186,26 @@ static uint8_t        MotorCtrl_SetModeRetry(uint8_t motor_id, uint8_t mode,
                                              uint32_t retry_max);
 static uint8_t        MotorCtrl_Enable(uint8_t motor_id, MotorMode *ack);
 static uint8_t        MotorCtrl_Disable(uint8_t motor_id, MotorMode *ack);
+static void           MotorCtrl_DisableOne(uint8_t motor_id);
 static void           MotorCtrl_DisableAll(void);
 static uint8_t        MotorCtrl_LogMode(uint8_t motor_id);
 static uint8_t        MotorCtrl_ReadStatus(uint8_t motor_id, int32_t *mileage, uint16_t *position);
-static uint8_t        MotorCtrl_TurnsRunaway(int32_t turns_before);
+static uint8_t        MotorCtrl_TurnsRunaway(uint8_t motor_id, int32_t turns_before);
 static void           MotorCtrl_Stop(uint8_t motor_id);
 #if MOTOR_SINGLE_MOVE_TEST
 static int32_t        MotorCtrl_AngleDiff(int32_t expected, int32_t measured);
-static uint8_t        MotorCtrl_WaitStill(void);
-static void           MotorCtrl_LogMoveResult(const char *tag, uint16_t target,
+static uint8_t        MotorCtrl_WaitStill(uint8_t motor_id);
+static void           MotorCtrl_LogMoveResult(uint8_t motor_id, const char *tag, uint16_t target,
                                               int32_t turns_before, uint8_t before_ok,
                                               uint16_t pos_before);
-static uint8_t        MotorCtrl_TestStep(uint16_t target, const char *tag);
+static uint8_t        MotorCtrl_TestStep(uint8_t motor_id, uint16_t target, const char *tag);
 #endif
 static void           MotorCtrl_LogVersion(uint8_t motor_id);
-static uint8_t        MotorCtrl_EnterPositionLoop(MotorMode *ack);
-static uint8_t        MotorCtrl_MoveToPosition(uint16_t position, const char *tag);
+static uint8_t        MotorCtrl_EnterPositionLoop(uint8_t motor_id, MotorMode *ack);
+static uint8_t        MotorCtrl_EnterPositionLoopAll(void);
+static uint8_t        MotorCtrl_MoveToPosition(uint8_t motor_id, uint16_t position, const char *tag);
 #if !MOTOR_SINGLE_MOVE_TEST
-static uint8_t        MotorCtrl_MoveTo(uint16_t angle_deg);   /* 只有 0°↔90° 往返用得到 */
+static uint8_t        MotorCtrl_MoveTo(uint8_t motor_id, uint16_t angle_deg);   /* 只有 0°↔90° 往返用得到 */
 #endif
 
 /* Private functions ---------------------------------------------------------*/
@@ -401,12 +416,12 @@ static uint8_t MotorCtrl_ReadStatus(uint8_t motor_id, int32_t *mileage, uint16_t
  * 防跑飞：和 MOTOR_MAX_TURNS_PER_MOVE 比较，超过就报警。
  * 里程读不到时返回 0（不报警）：偶尔丢一帧不该把正常工作停下来。
  */
-static uint8_t MotorCtrl_TurnsRunaway(int32_t turns_before)
+static uint8_t MotorCtrl_TurnsRunaway(uint8_t motor_id, int32_t turns_before)
 {
     int32_t turns_now = 0;
     int32_t delta;
 
-    if (MotorCtrl_ReadStatus(motor_ids[0], &turns_now, NULL) == 0U)
+    if (MotorCtrl_ReadStatus(motor_id, &turns_now, NULL) == 0U)
     {
         return 0U;
     }
@@ -424,7 +439,7 @@ static uint8_t MotorCtrl_TurnsRunaway(int32_t turns_before)
 
         (void)snprintf(line, sizeof(line),
                        "id=%u RUNAWAY: mileage %ld -> %ld (%ld turns) while moving <=270deg\r\n",
-                       (unsigned int)motor_ids[0], (long)turns_before, (long)turns_now,
+                       (unsigned int)motor_id, (long)turns_before, (long)turns_now,
                        (long)delta);
         UartLog_Print(line);
 
@@ -479,7 +494,7 @@ static int32_t MotorCtrl_AngleDiff(int32_t expected, int32_t measured)
  * 变化都不超过 MOTOR_TEST_STILL_COUNTS 才算停稳；最多等 MOTOR_TEST_SETTLE_MAX_MS。
  * 返回 1 = 等的时候按了键（后面自然会走“按键 = 失能”那条路）。
  */
-static uint8_t MotorCtrl_WaitStill(void)
+static uint8_t MotorCtrl_WaitStill(uint8_t motor_id)
 {
     uint16_t last      = 0;
     uint8_t  have_last = 0U;
@@ -502,7 +517,7 @@ static uint8_t MotorCtrl_WaitStill(void)
             continue;   /* 刚发完命令、电机还没启动，先别判“停住” */
         }
 
-        if (MotorCtrl_ReadStatus(motor_ids[0], NULL, &now) == 0U)
+        if (MotorCtrl_ReadStatus(motor_id, NULL, &now) == 0U)
         {
             continue;   /* 丢一帧不算，接着等 */
         }
@@ -540,7 +555,7 @@ static uint8_t MotorCtrl_WaitStill(void)
  *   每步 error 都差不多（一个固定的值）= 零点偏移，说明刻度是对的。
  * 里程差 = 实际转了几圈（只有跨过 0°/360° 那个点才会 +1）。
  */
-static void MotorCtrl_LogMoveResult(const char *tag, uint16_t target,
+static void MotorCtrl_LogMoveResult(uint8_t motor_id, const char *tag, uint16_t target,
                                     int32_t turns_before, uint8_t before_ok,
                                     uint16_t pos_before)
 {
@@ -552,9 +567,10 @@ static void MotorCtrl_LogMoveResult(const char *tag, uint16_t target,
     int32_t     err_deci;
     unsigned long err_abs;
 
-    if (Motor_QueryStatus(motor_ids[0], &status) == 0U)
+    if (Motor_QueryStatus(motor_id, &status) == 0U)
     {
-        (void)snprintf(line, sizeof(line), "%s: status query (0x74) FAILED (no 0x75)\r\n", tag);
+        (void)snprintf(line, sizeof(line), "id=%u %s: status query (0x74) FAILED (no 0x75)\r\n",
+                       (unsigned int)motor_id, tag);
         UartLog_Print(line);
         return;
     }
@@ -569,8 +585,9 @@ static void MotorCtrl_LogMoveResult(const char *tag, uint16_t target,
     if (before_ok != 0U)
     {
         (void)snprintf(line, sizeof(line),
-                       "%s: position %u (%u.%udeg) -> %u (%u.%udeg), error=%ld (%s%lu.%ludeg), "
+                       "id=%u %s: position %u (%u.%udeg) -> %u (%u.%udeg), error=%ld (%s%lu.%ludeg), "
                        "mileage %ld -> %ld (%ld turns)\r\n",
+                       (unsigned int)motor_id,
                        tag, (unsigned int)pos_before,
                        (unsigned int)(deci_before / 10U), (unsigned int)(deci_before % 10U),
                        (unsigned int)status.position,
@@ -583,8 +600,9 @@ static void MotorCtrl_LogMoveResult(const char *tag, uint16_t target,
     else
     {
         (void)snprintf(line, sizeof(line),
-                       "%s: position -> %u (%u.%udeg), error=%ld (%s%lu.%ludeg), "
+                       "id=%u %s: position -> %u (%u.%udeg), error=%ld (%s%lu.%ludeg), "
                        "mileage=%ld (no baseline)\r\n",
+                       (unsigned int)motor_id,
                        tag, (unsigned int)status.position,
                        (unsigned int)(deci_after / 10U), (unsigned int)(deci_after % 10U),
                        (long)error, (err_deci < 0) ? "-" : "+",
@@ -599,23 +617,23 @@ static void MotorCtrl_LogMoveResult(const char *tag, uint16_t target,
  * 返回 1 = 这一步的里程变化超过 MOTOR_MAX_TURNS_PER_MOVE，说明电机没在位置环里，
  * 调用方应该急停（和来回走时用的是同一个防跑飞阀值）。
  */
-static uint8_t MotorCtrl_TestStep(uint16_t target, const char *tag)
+static uint8_t MotorCtrl_TestStep(uint8_t motor_id, uint16_t target, const char *tag)
 {
     int32_t  turns_before = 0;
     uint16_t pos_before   = 0;
-    uint8_t  before_ok    = MotorCtrl_ReadStatus(motor_ids[0], &turns_before, &pos_before);
+    uint8_t  before_ok    = MotorCtrl_ReadStatus(motor_id, &turns_before, &pos_before);
 
-    (void)MotorCtrl_MoveToPosition(target, tag);
+    (void)MotorCtrl_MoveToPosition(motor_id, target, tag);
     WS2812_SetColor(MotorCtrl_LedNextColor());
 
-    if (MotorCtrl_WaitStill() != 0U)
+    if (MotorCtrl_WaitStill(motor_id) != 0U)
     {
         UartLog_Print("key pressed during test step\r\n");
     }
 
-    MotorCtrl_LogMoveResult(tag, target, turns_before, before_ok, pos_before);
+    MotorCtrl_LogMoveResult(motor_id, tag, target, turns_before, before_ok, pos_before);
 
-    return ((before_ok != 0U) && (MotorCtrl_TurnsRunaway(turns_before) != 0U)) ? 1U : 0U;
+    return ((before_ok != 0U) && (MotorCtrl_TurnsRunaway(motor_id, turns_before) != 0U)) ? 1U : 0U;
 }
 #endif /* MOTOR_SINGLE_MOVE_TEST */
 
@@ -658,7 +676,7 @@ static void MotorCtrl_LogVersion(uint8_t motor_id)
  * 不认 0x03 的固件也会回一个合法的 0xA1，只是模式值不是 0x03。
  * 所以按主流程的约定，由调用方（MotorCtrl_Task）在这之后再用 0x75/0x76 查一次模式复核。
  */
-static uint8_t MotorCtrl_EnterPositionLoop(MotorMode *ack)
+static uint8_t MotorCtrl_EnterPositionLoop(uint8_t motor_id, MotorMode *ack)
 {
     char line[MOTOR_LINE_SIZE];
     char hex[MOTOR_HEX_SIZE];
@@ -670,15 +688,15 @@ static uint8_t MotorCtrl_EnterPositionLoop(MotorMode *ack)
 
     /* 切之前先看一眼当前模式（使能之后默认是 0x01 电流环），方便对比 */
     UartLog_Print("mode before switch (expect 0x01 current loop):\r\n");
-    (void)MotorCtrl_LogMode(motor_ids[0]);
+    (void)MotorCtrl_LogMode(motor_id);
 
-    uint8_t ok = Motor_SetMode(motor_ids[0], MOTOR_MODE_POSITION, ack);
+    uint8_t ok = Motor_SetMode(motor_id, MOTOR_MODE_POSITION, ack);
 
     MotorCtrl_HexToText(ack->raw, MOTOR_FRAME_SIZE, hex, sizeof(hex));
 
     (void)snprintf(line, sizeof(line),
                    "id=%u set mode (0xA0/0x%02X position loop): reply=%s, mode=0x%02X (%s), rx=%s\r\n",
-                   (unsigned int)motor_ids[0], (unsigned int)MOTOR_MODE_POSITION,
+                   (unsigned int)motor_id, (unsigned int)MOTOR_MODE_POSITION,
                    (ok != 0U) ? "OK" : "NONE", (unsigned int)ack->mode,
                    Motor_ModeName(ack->mode), hex);
     UartLog_Print(line);
@@ -691,7 +709,7 @@ static uint8_t MotorCtrl_EnterPositionLoop(MotorMode *ack)
  *   position - 0~32767 对应 0~360°（360° = 满量程 32767）
  *   tag      - 日志里这句话的“标题”，比如 "move to 90deg" / "single move 2/2 -> 360deg"
  */
-static uint8_t MotorCtrl_MoveToPosition(uint16_t position, const char *tag)
+static uint8_t MotorCtrl_MoveToPosition(uint8_t motor_id, uint16_t position, const char *tag)
 {
     MotorValueAck ack;
     char          line[MOTOR_LINE_SIZE];
@@ -705,7 +723,7 @@ static uint8_t MotorCtrl_MoveToPosition(uint16_t position, const char *tag)
         return 0U;
     }
 
-    uint8_t ok = Motor_SetValue(motor_ids[0], (int16_t)position,
+    uint8_t ok = Motor_SetValue(motor_id, (int16_t)position,
                                 MOTOR_MOVE_ACCEL_TIME, MOTOR_MOVE_BRAKE, &ack);
 
     MotorCtrl_HexToText(ack.raw, MOTOR_FRAME_SIZE, hex, sizeof(hex));
@@ -714,7 +732,7 @@ static uint8_t MotorCtrl_MoveToPosition(uint16_t position, const char *tag)
     (void)snprintf(line, sizeof(line),
                    "id=%u %s (position=%u, 0x64): reply=%s, speed=%d, current=%d, "
                    "temp=%uC, fault=0x%02X (%s), rx=%s\r\n",
-                   (unsigned int)motor_ids[0], tag, (unsigned int)position,
+                   (unsigned int)motor_id, tag, (unsigned int)position,
                    (ok != 0U) ? "OK" : "NONE", (int)ack.speed, (int)ack.current,
                    (unsigned int)ack.temperature, (unsigned int)ack.fault, fault_text, hex);
     UartLog_Print(line);
@@ -727,43 +745,104 @@ static uint8_t MotorCtrl_MoveToPosition(uint16_t position, const char *tag)
  * 位置环下走一个角度：0° -> 0、90° -> 8191，换算走 Motor_AngleToPosition()。
  * （只有 0°↔90° 往返用得到；单次测试用的是下面的 MotorCtrl_MoveToPosition()）
  */
-static uint8_t MotorCtrl_MoveTo(uint16_t angle_deg)
+static uint8_t MotorCtrl_MoveTo(uint8_t motor_id, uint16_t angle_deg)
 {
     char tag[24];
 
     (void)snprintf(tag, sizeof(tag), "move to %udeg", (unsigned int)angle_deg);
 
-    return MotorCtrl_MoveToPosition(Motor_AngleToPosition(angle_deg), tag);
+    return MotorCtrl_MoveToPosition(motor_id, Motor_AngleToPosition(angle_deg), tag);
 }
 #endif /* !MOTOR_SINGLE_MOVE_TEST */
 
 /*
- * 失能总线上每一台电机（0xA0/0x09），每台都把收到的 10 字节打出来。
+ * 把所有电机都切到位置环并**逐一复核**（切完必须用 0x75 再查一次，只看 0xA1 不够：
+ * 不认 0x03 的固件也会回一个合法的 0xA1，那时电机其实还在电流/速度环里）。
+ * 返回 1 = 每一台都确认在位置环；0 = 有哪台没切上/没答上（调用方负责失能）。
+ */
+static uint8_t MotorCtrl_EnterPositionLoopAll(void)
+{
+    for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+    {
+        MotorMode mode_ack;
+
+        if (MotorCtrl_EnterPositionLoop(motor_ids[i], &mode_ack) == 0U)
+        {
+            UartLog_Print("set position loop FAILED (no valid 0xA1)\r\n");
+            return 0U;
+        }
+
+        /* 切完**再查一次模式**（0x75 -> 0x76），看看到底设置成功了没。
+           只看 0xA1「有没有回帧」是不够的：不认 0x03 的固件也会回一个合法的 0xA1，
+           这时电机其实还在电流环/速度环里，后面按“位置”发 0x64（8191）会被当成
+           电流/转速，电机就一直转（实测：目标 90°，1 秒连转 3 圈不停）。 */
+        UartLog_Print("mode after switch (expect 0x03 position loop):\r\n");
+
+        uint8_t mode_after = MotorCtrl_LogMode(motor_ids[i]);
+
+        if (mode_after == MOTOR_MODE_UNKNOWN)
+        {
+            /* 模式查询没答上（老固件？）：退回看 0xA1 echo 里的模式值 */
+            UartLog_Print("mode query did not answer, falling back to the 0xA1 echo\r\n");
+            mode_after = mode_ack.mode;
+        }
+
+        if (mode_after != MOTOR_MODE_POSITION)
+        {
+            char line[MOTOR_LINE_SIZE];
+
+            (void)snprintf(line, sizeof(line),
+                           "id=%u position loop NOT active (mode=0x%02X, %s): 0x64 would be "
+                           "read as current/speed - not sweeping\r\n",
+                           (unsigned int)motor_ids[i], (unsigned int)mode_after,
+                           Motor_ModeName(mode_after));
+            UartLog_Print(line);
+            return 0U;
+        }
+    }
+
+    UartLog_Print("position loop confirmed (0x03) on all motors\r\n");
+
+    return 1U;
+}
+
+/*
+ * 单台失能（0xA0/0x09）：把收到的 10 字节原样打出来。
  * 失能后电机只是「不使劲」，通信还在，所以轮询任务照样能查状态/故障码。
+ */
+static void MotorCtrl_DisableOne(uint8_t motor_id)
+{
+    MotorMode ack;
+    char      line[MOTOR_LINE_SIZE];
+    char      hex[MOTOR_HEX_SIZE];
+
+    uint8_t ok = MotorCtrl_Disable(motor_id, &ack);
+
+    MotorCtrl_HexToText(ack.raw, MOTOR_FRAME_SIZE, hex, sizeof(hex));
+
+    (void)snprintf(line, sizeof(line),
+                   "id=%u disable (0xA0/0x%02X): reply=%s, mode=0x%02X (%s), rx=%s\r\n",
+                   (unsigned int)motor_id, (unsigned int)MOTOR_MODE_DISABLE,
+                   (ok != 0U) ? "OK" : "NONE", (unsigned int)ack.mode,
+                   Motor_ModeName(ack.mode), hex);
+    UartLog_Print(line);
+}
+
+/*
+ * 失能总线上每一台电机（0xA0/0x09）。
  *
  * 最后把电机电源（PC14）也关掉：既然可控电源就是用来"不用的时候不带电"的，
  * 失能完还给它送电就没意义了（而且升级/意外时电机带电更不安全）。
  * 下次要使能会先重新上电（MotorPwr_OnAndSettle）。
+ *
+ * ⚠ 只有"全部失能"才切电源：两台共用同一路电源（PC14），单独失能某一台时
+ *   另一台可能还在干活，不能把它的电也断了（单台失能走 MotorCtrl_DisableOne）。
  */
 static void MotorCtrl_DisableAll(void)
 {
-    char line[MOTOR_LINE_SIZE];
-    char hex[MOTOR_HEX_SIZE];
-
     for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
     {
-        MotorMode ack;
-
-        uint8_t ok = MotorCtrl_Disable(motor_ids[i], &ack);
-
-        MotorCtrl_HexToText(ack.raw, MOTOR_FRAME_SIZE, hex, sizeof(hex));
-
-        (void)snprintf(line, sizeof(line),
-                       "id=%u disable (0xA0/0x%02X): reply=%s, mode=0x%02X (%s), rx=%s\r\n",
-                       (unsigned int)motor_ids[i], (unsigned int)MOTOR_MODE_DISABLE,
-                       (ok != 0U) ? "OK" : "NONE", (unsigned int)ack.mode,
-                       Motor_ModeName(ack.mode), hex);
-        UartLog_Print(line);
+        MotorCtrl_DisableOne(motor_ids[i]);
     }
 
     MotorPwr_Enable(0U);     /* 把电机电源也切了（没变化时不会重复写） */
@@ -872,10 +951,19 @@ uint8_t MotorCtrl_OtaMode(void)
  * 无线控制命令：上位机发 OTA_T_CTRL，payload[0] = cmd、payload[1..4] = arg。
  * 返回 OTA_OK 或 OTA_E_xxx（见 ota_layout.h），*out 是给上位机看的附加信息。
  */
-uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
+uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg, uint32_t *out)
 {
     MotorMode ack;
     uint8_t   ok = 1U;
+
+    /* motor_index：0 = 没指定（安全类命令作用于全部，运动类默认 1 号机）；
+                    1..MOTOR_COUNT = 指定那一台（= motor_ids[] 里的下标 +1） */
+    uint8_t   motor_id = MotorCtrl_MotorIdOfIndex((motor_index == 0U) ? 1U : motor_index);
+
+    if ((motor_index > MOTOR_COUNT))
+    {
+        return OTA_E_PARAM;    /* 指定了一个没有的电机序号 */
+    }
 
     if (out != NULL)
     {
@@ -895,14 +983,23 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
     switch (cmd)
     {
         case OTA_CTRL_DISABLE:
-            MotorCtrl_DisableAll();
+            /* 不指定电机（老上位机）= 全部失能，连电源一起切；
+               指定了 = 只失能那一台，**不切电源**（另一台还要干活） */
+            if (motor_index == 0U)
+            {
+                MotorCtrl_DisableAll();
+            }
+            else
+            {
+                MotorCtrl_DisableOne(motor_id);
+            }
             break;
 
         case OTA_CTRL_ENABLE:
             /* 同按键流程：先上电等稳定，再发使能帧（否则前面几次重试都是白跑） */
             MotorPwr_OnAndSettle();
 
-            if (MotorCtrl_Enable(motor_ids[0], &ack) == 0U)
+            if (MotorCtrl_Enable(motor_id, &ack) == 0U)
             {
                 ok = 0U;
             }
@@ -910,7 +1007,8 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
 
         case OTA_CTRL_POS_LOOP:
             /* 只看回帧不够（不认 0x03 的固件也会回合法的 0xA1），必须确认模式值真是 0x03 */
-            if ((MotorCtrl_EnterPositionLoop(&ack) == 0U) || (ack.mode != MOTOR_MODE_POSITION))
+            if ((MotorCtrl_EnterPositionLoop(motor_id, &ack) == 0U) ||
+                (ack.mode != MOTOR_MODE_POSITION))
             {
                 ok = 0U;
             }
@@ -921,7 +1019,7 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
             {
                 return OTA_E_PARAM;
             }
-            if (MotorCtrl_MoveToPosition((uint16_t)arg, "remote move (0x64)") == 0U)
+            if (MotorCtrl_MoveToPosition(motor_id, (uint16_t)arg, "remote move (0x64)") == 0U)
             {
                 ok = 0U;
             }
@@ -932,7 +1030,7 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
             {
                 return OTA_E_PARAM;
             }
-            if (MotorCtrl_MoveToPosition(Motor_AngleToPosition((uint16_t)arg),
+            if (MotorCtrl_MoveToPosition(motor_id, Motor_AngleToPosition((uint16_t)arg),
                                          "remote move (deg)") == 0U)
             {
                 ok = 0U;
@@ -940,7 +1038,18 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
             break;
 
         case OTA_CTRL_STOP:
-            MotorCtrl_Stop(motor_ids[0]);      /* 0x64 给定值 0 = 急停 */
+            /* 不指定 = 全部急停（安全默认）；指定了只停那一台 */
+            if (motor_index == 0U)
+            {
+                for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+                {
+                    MotorCtrl_Stop(motor_ids[i]);      /* 0x64 给定值 0 = 急停 */
+                }
+            }
+            else
+            {
+                MotorCtrl_Stop(motor_id);
+            }
             break;
 
         case OTA_CTRL_LOG_MUTE:
@@ -994,18 +1103,24 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
  * 只读状态快照：0x74（里程/位置/故障码）+ 0x75（当前模式）。
  * 比"一问一答 + 文本日志"更适合上位机画曲线。
  */
-uint8_t MotorCtrl_RemoteStatus(int32_t *mileage, uint16_t *position,
+uint8_t MotorCtrl_RemoteStatus(uint8_t motor_index, int32_t *mileage, uint16_t *position,
                                uint8_t *fault, uint8_t *mode)
 {
     MotorStatus status;
     MotorMode   mode_ack;
+    uint8_t     motor_id = MotorCtrl_MotorIdOfIndex((motor_index == 0U) ? 1U : motor_index);
 
     if ((mileage == NULL) || (position == NULL) || (fault == NULL) || (mode == NULL))
     {
         return OTA_E_PARAM;
     }
 
-    if (Motor_QueryStatus(motor_ids[0], &status) == 0U)
+    if ((motor_index > MOTOR_COUNT) || (motor_id == 0U))
+    {
+        return OTA_E_PARAM;    /* 指定了一个没有的电机序号 */
+    }
+
+    if (Motor_QueryStatus(motor_id, &status) == 0U)
     {
         return OTA_E_STATE;    /* 电机没答上（没上电/没接线） */
     }
@@ -1014,7 +1129,7 @@ uint8_t MotorCtrl_RemoteStatus(int32_t *mileage, uint16_t *position,
     *position = status.position;
     *fault    = status.fault;
 
-    if (Motor_QueryMode(motor_ids[0], &mode_ack) != 0U)
+    if (Motor_QueryMode(motor_id, &mode_ack) != 0U)
     {
         *mode = mode_ack.mode;
     }
@@ -1094,46 +1209,23 @@ void MotorCtrl_Task(void *argument)
         }
 
         /* 使能成功之后不再换色：接下来由「每走一步换一个颜色」当心跳 */
-        MotorMode mode_ack;
 
-        if (MotorCtrl_EnterPositionLoop(&mode_ack) == 0U)
+        /* 两台都切到位置环并逐一复核；有一台没切上就整组失能，不硬往下走 */
+        if (MotorCtrl_EnterPositionLoopAll() == 0U)
         {
-            UartLog_Print("set position loop FAILED (no valid 0xA1), press USER_KEY to retry\r\n");
-            continue;   /* 重新等按键 */
-        }
-
-        /* 切完**再查一次模式**（0x75 -> 0x76），看看到底设置成功了没。
-           只看 0xA1「有没有回帧」是不够的：不认 0x03 的固件也会回一个合法的 0xA1，
-           这时电机其实还在电流环/速度环里，后面按“位置”发 0x64（8191）会被当成
-           电流/转速，电机就一直转（实测：目标 90°，1 秒连转 3 圈不停）。 */
-        UartLog_Print("mode after switch (expect 0x03 position loop):\r\n");
-
-        uint8_t mode_after = MotorCtrl_LogMode(motor_ids[0]);
-
-        if (mode_after == MOTOR_MODE_UNKNOWN)
-        {
-            /* 模式查询没答上（老固件？）：退回看 0xA1 echo 里的模式值 */
-            UartLog_Print("mode query did not answer, falling back to the 0xA1 echo\r\n");
-            mode_after = mode_ack.mode;
-        }
-
-        if (mode_after != MOTOR_MODE_POSITION)
-        {
-            (void)snprintf(line, sizeof(line),
-                           "id=%u position loop NOT active (mode=0x%02X, %s): 0x64 would be "
-                           "read as current/speed - disabling instead of sweeping\r\n",
-                           (unsigned int)motor_ids[0], (unsigned int)mode_after,
-                           Motor_ModeName(mode_after));
-            UartLog_Print(line);
-
-            /* 没切进位置环就别往下发 0x64 了：直接失能，等她再按键重来 */
             MotorCtrl_DisableAll();
             WS2812_SetColor(WS2812_COLOR_OFF);
             UartLog_Print("motor disabled, press USER_KEY to enable again\r\n");
-            continue;
+            continue;   /* 重新等按键 */
         }
 
-        UartLog_Print("position loop confirmed (0x03), start moving\r\n");
+        /* ⚠ 台架测试（下面那段“走一圈”）**只跑 1 号机**，故意不两台同时走：
+           总线上同时发 0x64 会让两台一起转，桌面上容易撞，日志也会混在一起。
+           2 号机要用的时候发无线命令：
+             ctrl posloop  --motor 2   → 切位置环
+             ctrl movepos 8191 --motor 2   → 走 90°
+             ctrl movepos 0 --motor 2      → 回 0°
+             ctrl disable --motor 2        → 单台失能 */
 
         uint8_t runaway = 0U;
 
@@ -1152,7 +1244,8 @@ void MotorCtrl_Task(void *argument)
         int32_t turns_zero = 0;
         uint8_t zero_ok;
 
-        runaway = MotorCtrl_TestStep(MOTOR_TEST_START_POS, "single move 0 -> 0.0deg");
+        /* ⚠ 台架测试只跑 1 号机（见上面那段说明）：这里写死 motor_ids[0] */
+        runaway = MotorCtrl_TestStep(motor_ids[0], MOTOR_TEST_START_POS, "single move 0 -> 0.0deg");
 
         /* 记下“回 0° 之后”的里程当基准：下面 4 步加起来应该正好 1 圈 */
         zero_ok = MotorCtrl_ReadStatus(motor_ids[0], &turns_zero, NULL);
@@ -1167,7 +1260,7 @@ void MotorCtrl_Task(void *argument)
                            (unsigned long)step, (unsigned int)MOTOR_TEST_STEPS,
                            (unsigned int)(deci / 10U), (unsigned long)(deci % 10U));
 
-            runaway = MotorCtrl_TestStep(target, tag);
+            runaway = MotorCtrl_TestStep(motor_ids[0], target, tag);
         }
 
         if ((runaway == 0U) && (zero_ok != 0U))
@@ -1197,7 +1290,7 @@ void MotorCtrl_Task(void *argument)
             int32_t turns_before = 0;
             uint8_t baseline_ok  = MotorCtrl_ReadMileage(motor_ids[0], &turns_before);
 
-            (void)MotorCtrl_MoveTo(MOTOR_TARGET_A_DEG);
+            (void)MotorCtrl_MoveTo(motor_ids[0], MOTOR_TARGET_A_DEG);
             WS2812_SetColor(MotorCtrl_LedNextColor());
 
             if (MotorCtrl_DelayOrKeyPress(MOTOR_MOVE_DWELL_MS) != 0U)
@@ -1205,7 +1298,7 @@ void MotorCtrl_Task(void *argument)
                 break;
             }
 
-            if ((baseline_ok != 0U) && (MotorCtrl_TurnsRunaway(turns_before) != 0U))
+            if ((baseline_ok != 0U) && (MotorCtrl_TurnsRunaway(motor_ids[0], turns_before) != 0U))
             {
                 runaway = 1U;
                 break;
@@ -1213,7 +1306,7 @@ void MotorCtrl_Task(void *argument)
 
             baseline_ok = MotorCtrl_ReadMileage(motor_ids[0], &turns_before);
 
-            (void)MotorCtrl_MoveTo(MOTOR_TARGET_B_DEG);
+            (void)MotorCtrl_MoveTo(motor_ids[0], MOTOR_TARGET_B_DEG);
             WS2812_SetColor(MotorCtrl_LedNextColor());
 
             if (MotorCtrl_DelayOrKeyPress(MOTOR_MOVE_DWELL_MS) != 0U)

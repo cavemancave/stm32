@@ -12,8 +12,9 @@
     python tools/ota.py --port COM7 monitor                 # 当串口监视器看日志
     python tools/ota.py --port COM7 rollback                # 新固件有问题 → 切回旧槽
     python tools/ota.py --port COM7 reboot --boot           # 重启进 Bootloader 恢复台
-    python tools/ota.py --port COM7 status                  # 电机里程/位置/故障码
-    python tools/ota.py --port COM7 ctrl disable            # 电机失能
+    python tools/ota.py --port COM7 status                  # 两台电机的里程/位置/故障码
+    python tools/ota.py --port COM7 ctrl disable            # 电机失能（默认两台都失能）
+    python tools/ota.py --port COM7 ctrl movepos 8191 --motor 2   # 只让 2 号机走 90°
     python tools/ota.py --port COM7 ctrl pwron              # 电机电源上电（PC14 拉高）
     python tools/ota.py --port COM7 ctrl pwcycle            # 断电重启电机（状态卡死时用）
 
@@ -76,6 +77,10 @@ ST_TEXT = {
     ST_OFFSET: "偏移不对", ST_ERASE: "Flash 擦除失败", ST_WRITE: "Flash 写入失败",
     ST_CRC: "CRC32 不匹配", ST_PARAM: "参数非法", ST_NOTALLOWED: "不允许（比如要写正在运行的槽）",
 }
+
+# 这条总线上挂的电机台数（和 Device/Motor/motor_ctrl.c 的 MOTOR_COUNT 保持一致）。
+# 达妙这颗的 ID 是上电时锁存的（低=ID1 / 高=ID2），所以一条总线最多两台。
+N_MOTORS = 2
 
 CTRL = {
     "disable": 0x00, "enable": 0x01, "posloop": 0x02, "movepos": 0x03,
@@ -542,15 +547,24 @@ def cmd_reboot(dev: Device, args):
 
 
 def cmd_status(dev: Device, args):
-    rsp = dev.request(T_STATUS, timeout=3.0, retries=3)
-    if rsp is None:
-        raise OtaError("STATUS 没有回复（设备在跑吗）")
-    if rsp[0] != ST_OK:
-        raise OtaError(f"取状态失败：{ST_TEXT.get(rsp[0], rsp[0])}（电机没上电/没接线？）")
-    # 电机电源（PC14）是后加到回帧末尾的：老固件没有这一字节，所以判一下长度
-    pwr = f"  电机电源={'ON' if rsp[9] else 'OFF'}" if len(rsp) > 9 else ""
-    print(f"里程={i32(rsp, 1)} 圈  位置={u16(rsp, 5)}（{u16(rsp, 5) * 360.0 / 32768:.1f}°）  "
-          f"故障码=0x{rsp[7]:02X}  模式=0x{rsp[8]:02X}{pwr}")
+    """默认把总线上每一台都问一遍；--motor N 就只问那一台。"""
+    motors = [args.motor] if args.motor else list(range(1, N_MOTORS + 1))
+    pwr_note = ""
+
+    for mi in motors:
+        rsp = dev.request(T_STATUS, bytes([mi]), timeout=3.0, retries=3)
+        if rsp is None:
+            raise OtaError("STATUS 没有回复（设备在跑吗）")
+        if rsp[0] != ST_OK:
+            print(f"  电机{mi}: 没答上（{ST_TEXT.get(rsp[0], rsp[0])}）"
+                  f"—— 没上电 / 没接线 / ID 不是 {mi}？")
+            continue
+        # 电机电源（PC14）是后加到回帧末尾的：老固件没这一字节，所以判一下长度
+        if (not pwr_note) and len(rsp) > 9:
+            pwr_note = f"  电机电源={'ON' if rsp[9] else 'OFF'}"
+        print(f"  电机{mi}: 里程={i32(rsp, 1)} 圈  位置={u16(rsp, 5)}"
+              f"（{u16(rsp, 5) * 360.0 / 32768:.1f}°）  故障码=0x{rsp[7]:02X}"
+              f"  模式=0x{rsp[8]:02X}{pwr_note}")
 
 
 def cmd_ctrl(dev: Device, args):
@@ -562,13 +576,19 @@ def cmd_ctrl(dev: Device, args):
         cmd = CTRL[args.cmd]
         arg = args.arg if args.arg is not None else (
             1 if args.cmd in ("mute", "pause") else 0)
-    rsp = dev.request(T_CTRL, struct.pack("<BI", cmd, arg), timeout=15.0, retries=2)
+
+    # 第 6 个字节 = 电机序号（1 起；不填 = 设备按“安全类命令管全部、运动类默认 1 号机”处理）。
+    # 老固件只发 5 字节也照样能用，所以这是向后兼容的追加。
+    payload = struct.pack("<BI", cmd, arg) + (bytes([args.motor]) if args.motor else b"")
+    who = f" 电机{args.motor}" if args.motor else ""
+
+    rsp = dev.request(T_CTRL, payload, timeout=15.0, retries=2)
     if rsp is None:
         raise OtaError(f"{args.cmd} 没有回复（使能会重试约 5 s，再等等）")
     pwr = ""
     if cmd == 0x08:                     # 电源命令：data 返回当前状态（0/1）
         pwr = f"  电机电源={'ON' if u32(rsp, 1) else 'OFF'}"
-    print(f"{args.cmd}({arg}) → {ST_TEXT.get(rsp[0], rsp[0])}  data={u32(rsp, 1)}{pwr}")
+    print(f"{args.cmd}({arg}){who} → {ST_TEXT.get(rsp[0], rsp[0])}  data={u32(rsp, 1)}{pwr}")
 
 
 def cmd_console(dev: Device, args):
@@ -671,7 +691,11 @@ def main():
     p.set_defaults(func=cmd_upgrade, wait_boot=True)
 
     sub.add_parser("rollback", help="切回另一个槽并重启").set_defaults(func=cmd_rollback)
-    sub.add_parser("status", help="电机里程/位置/故障码").set_defaults(func=cmd_status)
+
+    p = sub.add_parser("status", help="电机里程/位置/故障码（默认两台都问）")
+    p.add_argument("--motor", type=int, default=0,
+                   help=f"只问这一台（1..{N_MOTORS}）；不填 = 每一台都问")
+    p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("erase", help="擦除某个槽")
     p.add_argument("slot", choices=["A", "B", "a", "b"])
@@ -686,6 +710,9 @@ def main():
                    help="disable/enable/posloop/movepos/movedeg/stop/mute/pause/pwr/pwron/pwoff/pwcycle")
     p.add_argument("arg", nargs="?", type=lambda s: int(s, 0), default=None,
                    help="参数：movepos=0..32767、movedeg=0..359、mute/pause=0/1、pwr=0/1/2")
+    p.add_argument("--motor", type=int, default=0,
+                   help=f"作用于哪一台（1..{N_MOTORS}）；不填 = 设备默认"
+                        f"（失能/急停管全部，使能/走位管 1 号机）")
     p.set_defaults(func=cmd_ctrl)
 
     sub.add_parser("console", help="等同于 monitor").set_defaults(func=cmd_console)

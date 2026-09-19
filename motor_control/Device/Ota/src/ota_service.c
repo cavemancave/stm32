@@ -233,7 +233,11 @@ static void OtaService_Ctrl(uint8_t seq, const uint8_t *pl, uint16_t len)
     }
     else
     {
-        rsp[0] = MotorCtrl_RemoteCmd(pl[0], Ota_GetLe32(&pl[1]), &out);
+        /* payload = cmd(1) arg(4) [motor(1)]：最后一个字节是**可选的**电机序号
+           （1 起；不填或 0 = 没指定），老上位机只发 5 字节也能用 */
+        uint8_t motor_index = (len >= 6U) ? pl[5] : 0U;
+
+        rsp[0] = MotorCtrl_RemoteCmd(motor_index, pl[0], Ota_GetLe32(&pl[1]), &out);
     }
 
     Ota_PutLe32(&rsp[1], out);
@@ -243,7 +247,7 @@ static void OtaService_Ctrl(uint8_t seq, const uint8_t *pl, uint16_t len)
     UartLog_Unlock();
 }
 
-static void OtaService_Status(uint8_t seq)
+static void OtaService_Status(uint8_t seq, const uint8_t *pl, uint16_t len)
 {
     int32_t  mileage  = 0;
     uint16_t position = 0U;
@@ -252,7 +256,11 @@ static void OtaService_Status(uint8_t seq)
     uint8_t  rsp[10];
     uint8_t  status;
 
-    status = MotorCtrl_RemoteStatus(&mileage, &position, &fault, &mode);
+    /* payload（可选）= motor(1)：电机序号（1 起；不填 = 1 号机）。回帧布局不变，
+       所以老上位机照样能读；要看第二台就再发一帧带序号的。 */
+    uint8_t motor_index = (len >= 1U) ? pl[0] : 0U;
+
+    status = MotorCtrl_RemoteStatus(motor_index, &mileage, &position, &fault, &mode);
 
     rsp[0] = status;
     Ota_PutLe32(&rsp[1], (uint32_t)mileage);
@@ -293,7 +301,7 @@ static void OtaService_OnFrame(uint8_t type, uint8_t seq, const uint8_t *pl, uin
             break;
 
         case OTA_T_STATUS:
-            OtaService_Status(seq);
+            OtaService_Status(seq, pl, len);
             break;
 
         default:

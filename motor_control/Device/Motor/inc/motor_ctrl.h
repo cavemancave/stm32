@@ -43,11 +43,20 @@ void MotorCtrl_OnPollTimer(void);
 void    MotorCtrl_SetOtaMode(uint8_t on);
 uint8_t MotorCtrl_OtaMode(void);
 
-/* 控制命令：cmd = OTA_CTRL_xxx，arg 是参数，*out 回传附加信息 */
-uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out);
+/* 控制命令：cmd = OTA_CTRL_xxx，arg 是参数，*out 回传附加信息。
+ *
+ * motor_index = 电机序号（= motor_ids[] 里的下标 +1，也就是“1 号机 / 2 号机”，不是总线 ID）：
+ *   0            = 没指定。安全类命令（失能/急停）作用于**全部**；
+ *                  运动类（使能/切位置环/走位）默认作用于 **1 号机**（老的命令行不变）。
+ *   1..MOTOR_COUNT = 只作用于那一台。
+ * 序号越界返回 OTA_E_PARAM。
+ * ⚠ 单台失能不会切电源（两台共用一路电源，另一台可能还在干活）；
+ *   “失能全部”（motor_index = 0）才会把 PC14 那一路电也断掉。 */
+uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg, uint32_t *out);
 
-/* 只读状态快照（0x74 + 0x75）：里程 / 位置原始值 / 故障码 / 当前模式 */
-uint8_t MotorCtrl_RemoteStatus(int32_t *mileage, uint16_t *position,
+/* 只读状态快照（0x74 + 0x75）：里程 / 位置原始值 / 故障码 / 当前模式。
+   motor_index 含义同上（0 = 1 号机） */
+uint8_t MotorCtrl_RemoteStatus(uint8_t motor_index, int32_t *mileage, uint16_t *position,
                                uint8_t *fault, uint8_t *mode);
 
 #endif /* __MOTOR_CTRL_H__ */
