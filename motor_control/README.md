@@ -156,6 +156,19 @@ CMake 片段和驱动一样按仓库惯例用 `include()` 从根 `CMakeLists.txt
 设计和取舍（为什么 A/B 双槽、为什么单 bank 不能自己改自己、各种异常怎么办）见
 [`docs/ota_design.md`](docs/ota_design.md)；这一节只说怎么用。
 
+### 硬件上已经跑通的（2026-09-19 实测）
+
+| 能力 | 验证方式 |
+| --- | --- |
+| 无线升级固件 | `upgrade` → 96380/96380 字节、`校验通过：槽 B crc32=…`、设备自己重启切槽 |
+| A/B 切槽 | BL 打印 `pending image OK -> switch to slot B` + `jump slot B PC=0x08094CCD`（PC 落在 B 槽） |
+| 启动确认 + 清计数 | App 跑满 2 s 打印 `ota: boot confirmed: slot=B, size=…, crc=…`，`info` 里 `启动计数 0/3` |
+| 一键回滚 | `rollback` → 重启后 `活动槽 A` |
+| BL 恢复台 + 超时兜底 | `reboot --boot` → `flags=0x81`、`info` 提示"设备正在 Bootloader 恢复台"；15 s 不动自动尝试启动 |
+| 两台电机（同总线 ID1/ID2） | `status` 两台都有回复；`ctrl movepos … --motor 2` 能让 2 号机动作 |
+| 电机电源开关（PC14） | 上电默认关断；按键/`ctrl enable` 先上电并等 500 ms 再发使能帧 |
+| 断点续传 / 坏包拒绝 | ⬜ **还没单独实测**（设计如此：进度 32 KB 落盘；`END` 用读回 CRC32 把关，不过就 不提交） |
+
 ### Flash 怎么分的、为什么不会变砖
 
 ```
