@@ -22,6 +22,7 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "ota_trace.h"     /* 故障现场输出（Debug 构建才有内容） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -73,7 +74,9 @@ extern TIM_HandleTypeDef htim6;
 void NMI_Handler(void)
 {
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
+  /* NMI 最典型的来源之一就是"读了 ECC 坏掉的 flash word"（往没擦过的地方重复
+     编程导致的），一定要打出来 —— 否则跟死循环根本分不清 */
+  OTATRACE_FAULT("NMI");
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
    while (1)
@@ -88,7 +91,8 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  /* ⚠ 必须留在 handler 的第一句话：宏要在编译器动 LR/栈之前取 EXC_RETURN 和异常帧地址 */
+  OTATRACE_FAULT("HardFault");
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -103,7 +107,7 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
+  OTATRACE_FAULT("MemManage (MPU)");
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -118,7 +122,7 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-
+  OTATRACE_FAULT("BusFault");
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -133,7 +137,7 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-
+  OTATRACE_FAULT("UsageFault");
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {

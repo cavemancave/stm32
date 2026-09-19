@@ -153,7 +153,16 @@ See http://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html. */
 /* Normal assert() semantics without relying on the provision of an assert.h
 header file. */
 /* USER CODE BEGIN 1 */
+/* 断言失败先把"哪一条、在哪个文件哪一行"打出来再死循环（OtaTrace_AssertFailed 用裸寄存器发，
+   不依赖 HAL/tick，见 Device/Ota/src/ota_trace.c）—— 比"一片安静"好查一万倍。
+   ⚠ 这里用 extern 声明而不是 #include：FreeRTOS 自己的 .c 文件没有我们的 include 路径。
+   ⚠ 只在 Debug 构建里带 file/line 字符串（Release 里那几 KB 字符串不值得）。 */
+#if defined(DEBUG)
+extern void OtaTrace_AssertFailed(const char *file, int line, const char *expr);
+#define configASSERT( x ) if ((x) == 0) { OtaTrace_AssertFailed(__FILE__, __LINE__, #x); taskDISABLE_INTERRUPTS(); for( ;; );}
+#else
 #define configASSERT( x ) if ((x) == 0) {taskDISABLE_INTERRUPTS(); for( ;; );}
+#endif
 /* USER CODE END 1 */
 
 /* Definitions that map the FreeRTOS port interrupt handlers to their CMSIS

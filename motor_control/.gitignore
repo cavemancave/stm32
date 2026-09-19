@@ -12,3 +12,6 @@ docs/*.pdf
 # 同样不入本库，结论已摘录到 docs/specification.md 与 README
 docs/*.bit
 docs/*.cfg
+
+# 上位机脚本（tools/）被 import 时会生成的 Python 缓存
+tools/__pycache__/

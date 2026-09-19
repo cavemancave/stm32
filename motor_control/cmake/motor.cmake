@@ -33,6 +33,13 @@ target_include_directories(motor PUBLIC
 # Inherit the STM32CubeMX include paths and symbols (main.h, usart.h, FreeRTOS, HAL, CMSIS)
 target_link_libraries(motor PUBLIC stm32cubemx)
 
+# 传输层会打日志（MotorIo_Init 的启动信息 / "RX 一直是脏的" 警告），需要 uart_log 的头文件。
+# 只有 motor_io.c 用得到，所以是 PRIVATE；UartLog_xxx 的符号由 uart_log 这个 OBJECT 库提供
+# （见 cmake/uart_log.cmake），最终都链进同一个可执行文件，这里不用显式 link。
+target_include_directories(motor PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../Device/UartLog/inc
+)
+
 # Attach to the project executable.
 # NOTE: plain signature - the root CMakeLists.txt also uses the plain form,
 # mixing plain and keyword signature for the same target is an error.

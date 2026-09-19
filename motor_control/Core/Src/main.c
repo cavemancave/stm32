@@ -29,6 +29,8 @@
 /* USER CODE BEGIN Includes */
 #include "BMI088driver.h"
 #include "ws2812.h"
+#include "ota_layout.h"      /* OTA_APP_BASE：本镜像链接在哪个槽（见 STM32H723xG_slots.ld） */
+#include "ota_trace.h"       /* 启动诊断（Debug 构建才输出，Release 里是空函数） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -119,6 +121,23 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 
+  /* 启动诊断（只在 Debug 构建里输出，见 Device/Ota/inc/ota_trace.h）：
+     它自己先把 USART1 配好（不依赖后面的 HAL/UART 初始化），
+     之后每过一步打一个字母。从 Bootloader 跳过来一片安静时，
+     串口上最后看到哪个字母，就知道卡在哪一句。 */
+  OtaTrace_Init();
+  OtaTrace_Text("[app] A: enter main (raw USART1 trace up)\r\n");
+
+  /* ⚠ 必须在任何中断使能之前，把向量表指到**本镜像所在的那个槽**：
+     H7 复位时 Flash 被硬件镜像到 0x00000000，而 system_stm32h7xx.c 里
+     SCB->VTOR 那句被 #if defined(USER_VECT_TAB_ADDRESS) 包着、默认**不执行**，
+     所以 VTOR 一直是复位值 0。从 Bootloader 跳过来时它指的是 Flash 里的
+     0x08000000（= BL 自己的向量表），不改的话所有中断都会跑到 BL 的 handler 里去
+     （HAL_Delay 卡死、FreeRTOS 不调度）。
+     槽基址由链接脚本的 --defsym APP_BASE 给出。 */
+  SCB->VTOR = OTA_APP_BASE;
+  OtaTrace_Text("[app] B: VTOR = slot base\r\n");
+
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
@@ -131,12 +150,20 @@ int main(void)
 
   /* USER CODE BEGIN Init */
 
+  /* 能打到这里 = MPU_Config() + HAL_Init() 都过了。
+     注意 HAL 的时基是 **TIM6**（不是 SysTick，SysTick 留给 FreeRTOS 当调度节拍）：
+     TIM6 不工作的话下面 HAL_Delay 会一直转（后面的标记就打不出来） */
+  OtaTrace_Text("[app] C: MPU + HAL_Init ok (TIM6 timebase)\r\n");
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+
+  /* 能打到这里 = HSE / PLL / VOSRDY 都过了 */
+  OtaTrace_Text("[app] D: SystemClock_Config ok\r\n");
 
   /* USER CODE END SysInit */
 
@@ -147,7 +174,11 @@ int main(void)
   MX_SPI2_Init();
   MX_SPI6_Init();
   MX_USART10_UART_Init();
+
   /* USER CODE BEGIN 2 */
+
+  /* 五个外设的 HAL 初始化都过了；下一个可能卡死的是 HAL_Delay（要 TIM6 中断） */
+  OtaTrace_Text("[app] E: MX_*_Init ok\r\n");
 
   /* 使能可控 5V：板载 WS2812 指示灯由这一路供电，上电默认是关的 */
   HAL_GPIO_WritePin(Power_5V_EN_GPIO_Port, Power_5V_EN_Pin, GPIO_PIN_SET);
@@ -158,6 +189,8 @@ int main(void)
   /* 5V 有了再发一帧全灭：MCU 单独复位时灯珠会保留上一次的颜色 */
   WS2812_Ctrl(0U, 0U, 0U);
 
+  OtaTrace_Text("[app] F: 5V on + WS2812 ok (HAL_Delay 也过了)\r\n");
+
   /* ⚠ 电机挂在 USART10 上：PE2 = RX、PE3 = TX，38400 8N1（见 usart.c）。
      PE3 (TX) 必须是开漏 (GPIO_MODE_AF_OD)：电机控制板是 5V TTL 单总线，
      高电平靠总线上拉；TX 推挽会让输出 MOS 管常通，在总线上误发信号。
@@ -165,6 +198,8 @@ int main(void)
 
   /* 业务相关的初始化（日志互斥、电机串口 + 请求队列、轮询任务/信号量）都在
      MX_FREERTOS_Init() 里做：那些对象要求 osKernelInitialize() 已经跑过。 */
+
+  OtaTrace_Text("[app] G: main() done, calling osKernelInitialize()\r\n");
 
   /* USER CODE END 2 */
 
@@ -174,6 +209,13 @@ int main(void)
 
   /* Start scheduler */
   osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+
+  OtaTrace_Text("[app] !! osKernelStart returned (should never happen)\r\n");
 
   /* We should never get here as control is now taken by the scheduler */
 

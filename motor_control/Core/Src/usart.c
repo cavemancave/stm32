@@ -199,6 +199,22 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
      这个 Mode 是 CubeMX 按 PE3 的 "Output type = Open Drain" 生成的，
      仅在代码里改会被下次 Generate Code 覆盖，要改请在 CubeMX 里改。 */
 
+  /* PE2 (USART10_RX) 补一个内部上拉 —— 这一小段是手写的（在 USER CODE 区里，生成代码不会覆盖）。
+     为什么：CubeMX 生成的是 GPIO_NOPULL，而这条 5V 单总线是靠外部上拉维持空闲高电平的。
+     **电机没接 / 总线上没有上拉时，PE2 就是悬空的**，会被噪声刷出一串假字节
+     （38400 下约 3840 B/s），表现为：
+       1) 启动时"清空串口 RX"的循环永远退不出来（曾把 App 卡死在 MotorIo_Init，查了很久）；
+       2) 每次一问一答前面都要白扔一堆垃圾字节；3) 电机明显没接却一直在重试通信。
+     加上内部上拉后，空载时线保持高电平 → 一个假字节都不会有。
+     正常接线时无影响：外部上拉/驱动器会把线拉低，40 kΩ 的内部上拉可以忽略。
+     （想让它由 CubeMX 生成也行：PE2 → GPIO Pull-up，然后把这段删掉。） */
+  GPIO_InitStruct.Pin       = GPIO_PIN_2;
+  GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull      = GPIO_PULLUP;
+  GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF4_USART10;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
   /* USER CODE END USART10_MspInit 1 */
   }
 }

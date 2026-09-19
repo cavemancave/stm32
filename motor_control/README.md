@@ -63,7 +63,7 @@ CMake 片段和驱动一样按仓库惯例用 `include()` 从根 `CMakeLists.txt
 | `Device/Motor/motor_io.c` `inc/motor_io.h` | 传输层：请求队列 + 独占 USART10 的收发任务 `MotorIo_Task`；对上只暴露 `MotorIo_Exchange()` | 同上 |
 | `Device/Motor/motor_fmt.c` `inc/motor_fmt.h` | 纯格式化：模式名 / 故障码文本 / 角度↔位置换算 | 同上 |
 | `Device/Motor/motor_ctrl.c` `inc/motor_ctrl.h` | 业务层：`MotorCtrl_Task`（主流程）、`MotorCtrl_PollTask`（轮询）、`MotorCtrl_OnPollTimer`（定时器回调） | `cmake/motor_ctrl.cmake` |
-| `Device/UartLog/uart_log.c` `inc/uart_log.h` | UART7 调试日志，内部带互斥，多任务可并发打 | `cmake/uart_log.cmake` |
+| `Device/UartLog/uart_log.c` `inc/uart_log.h` | 调试日志：主口 = 无线口 USART1，UART7 镜像；内部带互斥，多任务可并发打，OTA 期间可静音 | `cmake/uart_log.cmake` |
 
 | 任务 / 对象 | 优先级 | 说明 |
 | --- | --- | --- |
@@ -101,7 +101,7 @@ CMake 片段和驱动一样按仓库惯例用 `include()` 从根 `CMakeLists.txt
 | 后续④：失能 | 来回走的时候再按一下键 → 发 `0xA0/0x09`（`Motor_Disable`）失能每台电机，把回帧的 `mode` 也打出来，然后回到等按键。失能只是「不使劲」，通信还在，所以 `motorPoll` 那一路的 0x74 轮询照旧 |
 | 状态轮询 | 定时器每 **200 ms**（`MOTOR_CTRL_POLL_MS`）唤醒 `MotorCtrl_PollTask`，查一轮 `0x74`（等 `0x75`），打印**里程圈数、位置原始值（并换算成 0.1°）、故障码（按位译成 hall/overcurrent/stall/overtemp/link-loss/voltage，未知位写 other）** |
 | 灯 | 只由 `MotorCtrl_Task` **一个**任务点（WS2812 走 SPI6，两个任务同时点会把帧打断）。每次点灯从枚举里**依次**取一个颜色（`RED → GREEN → BLUE → YELLOW → CYAN → MAGENTA → WHITE → RED`，跳过 `OFF`）：上电红 → 按键后绿 → 之后由「每走一步换一个颜色」当心跳；**失能时直接点 `OFF`（灭）**，看到灯灭就知道电机不使劲了（再按键使能时接着按枚举换下一个颜色）。亮度不在业务里设，用驱动默认 `WS2812_DEFAULT_BRIGHTNESS = 32`（含义是 R+G+B 之和；要调就改 `ws2812.h` 那个宏或开机调 `WS2812_SetBrightness()`），所以 红/绿/蓝 分别是 `(32,0,0)`、`(0,32,0)`、`(0,0,32)` |
-| 日志 | 打在 **UART7**（115200）上，见下面「串口输出」一节 |
+| 日志 | 打在 **无线口 USART1**（115200）上，同时镜像到 UART7，见「无线 OTA 升级」和「串口输出」两节 |
 
 帧格式：`ID | 功能码 | DATA[2..8] | CRC8`
 
@@ -149,6 +149,131 @@ CMake 片段和驱动一样按仓库惯例用 `include()` 从根 `CMakeLists.txt
 - BMI088 的初始化、打包、发送三处都用 `#if 0` 关着（`Core/Src/main.c`），
   要放开时把这三处改回 `#if 1`，并同时把 WS2812 的绿灯状态逻辑接回去。
 
+## 无线 OTA 升级（以后不用再插 ST-Link）
+
+无线模块接在 **USART1（PA9 = TX / PA10 = RX）** 上，电脑那边是一个配对的串口。
+这一个口平时就是**调试日志 + 控制命令**，要升级时同一套协议里夹着传固件。
+设计和取舍（为什么 A/B 双槽、为什么单 bank 不能自己改自己、各种异常怎么办）见
+[`docs/ota_design.md`](docs/ota_design.md)；这一节只说怎么用。
+
+### Flash 怎么分的、为什么不会变砖
+
+```
+0x08000000  128K  Bootloader（永不 OTA 更新，只在第一次用 ST-Link 烧）
+0x08020000  384K  Slot A  ←  motor_control.bin
+0x08080000  384K  Slot B  ←  motor_control_slotB.bin（同一份源码、只换链接基址）
+0x080E0000  128K  元数据（在哪个槽 / 版本 / CRC / 续传进度，顺序追加写）
+```
+
+* 正在跑的槽**永远不写**（协议里直接拒绘）—— 新固件写进另一个槽，校验通过后重启，由 Bootloader 切槽；
+* 新固件跑起来 2 s 后要「报到」（写启动确认）。连着 3 次没报到 = 判坏，**自动回滚**到旧槽；
+* 两个槽都跑不起来 → 上电自动进 Bootloader 的**恢复台**，同一个口重发固件就行
+  （`flash --slot A/B` 指定写哪个槽）；
+* 传输断了/掉电了不要紧：进度每 32 KB 落一次盘，重新 `flash` 会从断点续传；
+* Bootloader 自己不 OTA（H723 单 bank 没有硬件 bank swap，自升级失败就真砖了），
+  所以它只在第一次烧一次 —— 这是整个方案的地基。
+
+### 第一次（也是最后一次）用 ST-Link
+
+| 烧什么 | 烧到哪 |
+| --- | --- |
+| `build/Debug/motor_boot.hex`（或 .bin/.elf） | `0x08000000` |
+| `build/Debug/motor_control.hex`（或 .bin/.elf） | `0x08020000` |
+
+第一次上电时元数据是空的，Bootloader 会「看着向量表像 App」先跳进去；
+App 跑满 2 s 后把自己登记到元数据里（长度 + CRC32 + 版本），之后就是正常状态。
+
+#### ⚠⚠ 烧录时最容易把板子"烧哑"的两个坑
+
+1. **勾了 Full chip erase / Erase all 之后，两个 hex 都要烧回去！**
+   只烧 App 的话 `0x08000000` 是空的，CPU 从空白 Flash 启动 =
+   **上电后串口一个字符都没有**（看起来像板子坏了，其实只是 BL 没了）。
+2. **别用 `.bin` 乱填地址。** `.bin` 不带地址信息，起始地址填错（尤其是把 App
+   填成 `0x08000000`）会把 Bootloader 覆盖掉。优先烧 `.hex`（自带地址）。
+
+想确认烧对了没有，用 ST-Link 读一下 `0x08000000` 的前 8 字节：
+应该是 `00 02 00 20`（SP = `0x20020000`）后面跟一个 `0x0800xxxx`
+（PC，最低位必须是 1）—— 那就是 Bootloader 的向量表。
+`0x08020000` 处同理，只是 PC 变成 `0x0802xxxx`。
+
+#### 元数据（`0x080E0000`）自己坏掉了怎么办
+
+不用慌，不会变砖：
+
+* 新版 Bootloader 上电发现某个 flash word 坏了（读它 NMI/总线错误）会自动
+  **把坏掉的扇区擦掉再复位**（`S0` 也就是 Bootloader 自己永不擦），然后正常启动；
+* 也可以手动解决：ST-Link 把 `0x080E0000` 那个扇区擦掉（或者干脆全片擦除后
+  把上面两个 hex 重烧一遍）。擦了元数据只是丢掉 A/B 记录，App 跑起来会重新登记；
+* App 里如果登记失败，串口会打 `ota: boot confirm FAILED (st=..)`，不再静默。
+
+### 日常升级
+
+```bash
+pip install pyserial
+python tools/ota.py --port COM7 info                       # 看当前在哪个槽、版本、两个槽的 CRC
+python tools/ota.py --port COM7 flash build/Debug/motor_control_slotB.bin
+python tools/ota.py --port COM7 rollback                   # 新固件有问题 → 一键切回旧槽
+python tools/ota.py --port COM7 reboot --boot              # 手动进 Bootloader 恢复台（救砖）
+python tools/ota.py --port COM7 monitor                    # 当串口监视器看日志
+python tools/ota.py --port COM7 status                     # 电机里程/位置/故障码
+python tools/ota.py --port COM7 ctrl disable               # 电机失能（enable/posloop/movepos/... 同理）
+```
+
+`flash` 会自动挑槽（写在非活动槽）并**检查你给的 .bin 是给哪个槽编的**
+（.bin 里的复位向量一看就知道），给错了直接拒练，避免把 A 的镜像写进 B 槽、跳过去必崩。
+
+### 关于 CRC32：设备算的是「Flash 内容」，不是「.bin 文件」
+
+设备侧的 CRC32（元数据登记、Bootloader 的槽校验、OTA 的 `END` 校验）**永远是把它槽里的
+Flash 内容读回来算的**，而上位机算的是 `.bin` 文件本身。多数时候两者一样，
+但有一种情况会不一样：
+
+* 链接脚本会在两个 section 之间留下**对齐空洞**（本工程是 `0x080202CC` 那 4 字节）；
+* `objcopy -O binary` 把空洞填成 `0x00`，而 ST-Link 烧 `.hex` 时那些位置是**跳过**的、
+  保持擦除态 `0xFF`。
+
+于是同一个镜像有两个 CRC32：走 ST-Link 烧进去的是 `0xFF` 版本（实测 App = `0x27F6680E`），
+上位机对 `.bin` 算出的是 `0x00` 版本（当前构建 = `0xABAA221F`）。
+
+**这不影响功能**：设备侧永远自洽 —— 元数据里登记的就是它自己算的那个值，
+Bootloader 用完全相同的方式重算再比；走 OTA 时空洞会被写成 `0x00`，
+所以设备读回算出的 CRC 又和上位机的 `.bin` CRC 一致（`flash` 最后一步就是这么比的）。
+**但别拿 `info` 里的 CRC32 去和 `selftest` 报的 `.bin` CRC 硬比**（除非那次是走 OTA 写进去的）。
+
+构建一次会出三个镜像：
+
+| 产物 | 链接基址 | 用途 |
+| --- | --- | --- |
+| `motor_control.bin` | 0x08020000 (Slot A) | 主固件 |
+| `motor_control_slotB.bin` | 0x08080000 (Slot B) | **同一份源码**、只换基址（A/B 双槽必需） |
+| `motor_boot.bin` | 0x08000000 | Bootloader，只在第一次烧 |
+
+### 这一个口上的三种东西怎么共存
+
+| 内容 | 形式 |
+| --- | --- |
+| 调试日志 | **裸文本**（ASCII + `\r\n`），和以前打 UART7 一模一样（UART7 现在是镜像口） |
+| 控制信息 | 二进制帧：`CTRL_CMD`（使能/失能/切位置环/走位置/急停/静音/停轮询）、`CTRL_STATUS`（里程/位置/故障码） |
+| 固件 | 二进制帧：`OTA_BEGIN/DATA/END`（1 KB 一包，停等 + 重传 + 续传） |
+
+帧的封装是 `0x00 + COBS(帧) + 0x00`：文本里不出现 `0x00`，COBS 编码后的帧里也不出现 `0x00`，
+所以上位机看到两个 `0x00` 之间的一段就试着解帧、CRC32 不过就当文本丢掉 —— 三种内容不打架。
+
+### 升级期间板子会做什么
+
+`OTA_BEGIN` 一到：**电机全部失能** + **停 200 ms 状态轮询** + **静音日志**（别抢带宽），
+然后擦除目标槽的 3 个扇区（一次做完，之后只剩 32 字节 flash word 的编程停顿），逐块收数据；
+30 s 收不到任何帧就自动放弃并恢复日志/轮询（已写入的内容保留，下次续传）。
+升级完成后需要**用户自己**再按键/发命令使能电机，不会自动转。
+
+### ⚠ 别在 CubeMX 里勾 USART1
+
+`Device/Ota/ota_com.c` **自己**初始化 USART1（RCC + GPIO + NVIC + `HAL_UART_Init`）：
+Bootloader 目标里根本没有 `Core/Src/usart.c` / `stm32h7xx_it.c`（它们是生成文件、每次重写），
+放自己文件里两个目标都能用、也不会被覆盖。
+如果你更习惯 CubeMX：勾上 USART1 之后，把 `ota_com.c` 里的硬件初始化和 `USART1_IRQHandler`
+删掉、改用 `MX_USART1_UART_Init()` + `huart1` —— **两套只能留一套**，否则重复定义。
+
 ## 构建
 
 工具链不在默认 `PATH` 里，需要先指向 STM32Cube 的 bundle：
@@ -165,12 +290,15 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
    根 `CMakeLists.txt` 只在**第一次**生成，之后的用户改动不会被覆盖。
 2. 自己新增的驱动**不要**直接写进生成文件，统一走「独立 cmake 片段」模式：
    - 配置放在 `cmake/bmi088.cmake`、`cmake/ws2812.cmake`、`cmake/motor.cmake`、
-     `cmake/motor_ctrl.cmake`、`cmake/uart_log.cmake`
+     `cmake/motor_ctrl.cmake`、`cmake/uart_log.cmake`、`cmake/ota.cmake`
      （CubeMX 不认这些文件，永远不会被覆盖）
    - 由根 `CMakeLists.txt` 里的几行 `include(cmake/xxx.cmake)` 拉进来
    - ⚠ **请求队列不在 CubeMX 里**：`Device/Motor/motor_io.c` 自己用 `xQueueCreate()` 建。
      以前在 CubeMX 里配的那个 `motorQueue`（item type `uint16_t`，2 字节）装不下一个请求，
      已经删掉了；别在 CubeMX 里再加回来。
+   - ⚠ **无线 OTA 的三个镜像**（`motor_control` / `motor_control_slotB` / `motor_boot`）都在
+     `cmake/ota.cmake` 里建，链接基址靠 `STM32H723xG_slots.ld` + `--defsym APP_BASE`，
+     同样不要写进生成文件。
 3. 所以 regenerate 之后如果发现某个驱动没编进固件，**先看那几行 `include()` 还在不在**，
    不要急着改 `cmake/stm32cubemx/CMakeLists.txt`（改了下次还会丢）。
 4. `freertos.c` 里、`USER CODE` 段之外的**任务入口名**（`StartDefaultTask` / `MotorTask` /
@@ -184,6 +312,16 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
 > 教训（2026-09-16）：BMI088 的源文件一开始是直接加在生成文件里的，一次 “Generate Code”
 > 就被抹掉了，之后才改成现在的片段写法。
 
+6. **`STM32H723xG_flash.ld` 已经被弃用**：CubeMX 每次还是会重新生成它，但根 `CMakeLists.txt`
+   把工具链里那行写死的 `-T .../STM32H723xG_flash.ld`（和 `-Map` 名字）摘掉了，
+   三个镜像统一用 **`STM32H723xG_slots.ld`** + `--defsym APP_BASE`。
+   所以：不要去改那个生成出来的 `.ld`（改了也没用），内存布局有变化时同步
+   `STM32H723xG_slots.ld` 里那几行 `MEMORY` 就行。
+7. **不要**在 CubeMX 里勾 USART1（原因见「无线 OTA 升级」一节最后）。引脚清单里
+   PA9/PA10 应该一直是“未分配”。
+8. 升级/分区相关的动态都在 `USER CODE` 段里：`Core/Src/main.c` 只多一行 `SCB->VTOR = OTA_APP_BASE;`
+   （**必须在 `MPU_Config()` 之前**），`Core/Src/freertos.c` 里只改了日志口和加上 OTA 服务初始化。
+
 ## 硬件要点（DM-MC-Board02）
 
 | 功能 | 引脚 |
@@ -193,7 +331,8 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
 | BMI088 加速度片选 / 陀螺片选 | PC0 / PC3 |
 | SPI2：SCK / MOSI / MISO | PB13 / PC1 / PC2_C |
 | SPI2 中断：ACC_INT / GYRO_INT | PE10 / PE12 |
-| UART7（调试日志，115200） | PE7 (RX) / PE8 (TX) |
+| UART7（调试日志镜像，115200） | PE7 (RX) / PE8 (TX) |
+| **USART1（无线串口：日志 + 控制 + OTA，115200）** | **PA9 = TX / PA10 = RX**（AF7，模块侧标 UART0） |
 | USART10（电机，38400） | PE2 (RX) / PE3 (TX)，AF4 / AF11；**PE3 是开漏 AF_OD**（电机板 5V TTL，推挽会误发信号） |
 | 板载 WS2812：DIN | **PA7 = SPI6_MOSI** |
 
@@ -225,10 +364,11 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
 - 以后要用 PA5 的按键/ADC 时，必须先把 WS2812 改成不占 SPI 外设的方案
   （例如 PA7 当普通 GPIO 位翻转时序），然后就可以在 CubeMX 里把 SPI6 关掉。
 
-## 串口输出（UART7 = 调试日志）
+## 串口输出（无线口 USART1 = 主日志口，UART7 = 镜像）
 
-- UART7，**115200** 8N1（UART7 内核时钟 = D2PCLK1 = 120 MHz → USARTDIV 1041.625，误差 ≈ -0.004%）。
-- 电机相关的日志都打在 UART7 上，纯文本、`\r\n` 结尾。上电先打：
+- 日志现在从 **USART1（PA9/PA10，接无线模块）** 出去，同时镜像到 **UART7（PE7/PE8）**；
+  两个口都是 **115200** 8N1（UART7 内核时钟 = D2PCLK1 = 120 MHz → USARTDIV 1041.625，误差 ≈ -0.004%）。
+- 电机相关的日志都是纯文本、`\r\n` 结尾。上电先打：
   - `motor control (FreeRTOS): USART10 38400, press USER_KEY (PA15) to start`（等待按键）
   - 按键后：`key pressed, enabling motor (0xA0/0x08, retry until answered)...`
   - 成功：`id=1 enable OK (0xA1), mode=0x01 (current loop), rx=01 A1 01 00 00 00 00 00 00 E0`

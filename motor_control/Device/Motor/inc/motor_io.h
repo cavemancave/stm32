@@ -32,6 +32,16 @@
 /* 请求队列深度：同时能挂多少个待处理的收发请求 */
 #define MOTOR_IO_QUEUE_LEN             8U
 
+/* 清 RX 时最多丢掉多少字节（**硬上限，绝不能不设上限**）。
+   原因见 motor_io.c 里 MotorIo_FlushRx 的注释：
+   单线 5V 总线上如果线被拉低 / 电机没上电 / 波特率不对，
+   USART 会按波特率源源不断产生字节，没有上限的 while 就永远出不来 ——
+   表现是「开机卡死在这里、一声不吭」。 */
+#define MOTOR_IO_FLUSH_MAX_BYTES       64U
+
+/* 打印警告时顺手把「线上到底是什么」抓前几个字节出来看 */
+#define MOTOR_IO_FLUSH_SNIFF_LEN       8U
+
 /* 往队列里投递的最长等待（队列满时才用得上） */
 #define MOTOR_IO_QUEUE_TIMEOUT_MS      200U
 
@@ -42,6 +52,9 @@
  * 初始化：绑定串口 + 建请求队列。必须在 osKernelInitialize() 之后调用
  * （freertos.c 的 MX_FREERTOS_Init() 里会调）。
  *   huart - 电机所在串口，传 &huart10
+ *
+ * 内部会顺手把 RX 里残留的字节清掉（有上限，最多 MOTOR_IO_FLUSH_MAX_BYTES），
+ * 清不干净只会放弃并打一行日志，**不会阻塞启动**。
  */
 void MotorIo_Init(UART_HandleTypeDef *huart);
 

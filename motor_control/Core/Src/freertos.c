@@ -26,10 +26,14 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 #include "usart.h"
 #include "motor_io.h"
 #include "motor_ctrl.h"
 #include "uart_log.h"
+#include "ota_com.h"
+#include "ota_service.h"
+#include "ota_trace.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -81,7 +85,8 @@ const osTimerAttr_t motorPos_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-
+/* 启动路标：把“走到哪一步”和“还剩多少 FreeRTOS 堆”一起打出来（只在 Debug 构建里真的输出） */
+static void ota_boot_mark(const char *tag);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -98,11 +103,26 @@ void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
 
-  /* 日志口（UART7）和电机串口（USART10 + 请求队列）。
-     这两个都要在 osKernelInitialize() 之后才能建互斥量/队列，
-     而 MX_FREERTOS_Init() 正好是那个时候被调的。 */
-  UartLog_Init(&huart7);
+  /* 无线口 USART1（PA9/PA10）：日志 + 控制帧 + OTA 三合一。
+     先起串口，再把它挂成日志主口，最后才建 otaSvc 任务。
+     ⚠ 每一步都打一个路标 + 剩余 FreeRTOS 堆：这几个 osXxxNew 全都从 FreeRTOS 堆里分配，
+       堆不够时表现就是“卡在这里一声不吭”，有堆数字才能一眼看出来。 */
+  OtaCom_Init(OTA_PORT_BAUD);
+  ota_boot_mark("H1: USART1 up");
+
+  /* 日志口：主口 = 无线口 USART1；板上有线的 UART7 顺便镜像一份（不接线也不影响）。
+     不想要镜像就把 UartLog_AddSink(&huart7) 这行删掉。 */
+  UartLog_Init(OtaCom_Handle());
+  UartLog_AddSink(&huart7);
+  ota_boot_mark("H2: log ready (mutex)");
+
+  /* OTA 服务：建 otaSvc 任务（收帧/收固件），里面还会装 ota_host 的钩子 */
+  OtaService_Init();
+  ota_boot_mark("H3: otaSvc task");
+
+  /* 电机串口（USART10 + 请求队列） */
   MotorIo_Init(&huart10);
+  ota_boot_mark("H4: motor io (queue)");
 
   /* USER CODE END Init */
 
@@ -123,6 +143,7 @@ void MX_FREERTOS_Init(void) {
   /* 状态轮询定时器：周期到了只释放信号量（回调在 timer service task 里跑，
      绝对不能阻塞），真正的收发由 MotorCtrl_PollTask 做。 */
   (void)osTimerStart(motorPosHandle, pdMS_TO_TICKS(MOTOR_CTRL_POLL_MS));
+  ota_boot_mark("I1: poll timer started");
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
@@ -141,6 +162,8 @@ void MX_FREERTOS_Init(void) {
   /* add threads, ... */
   /* 轮询信号量 + 轮询任务（CubeMX 的线程列表里没有它，所以在这里建） */
   MotorCtrl_Init();
+
+  ota_boot_mark("I2: all threads created -> start scheduler");
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -202,6 +225,20 @@ void motorPosCallback(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+/* 启动路标（Debug 构建里真的输出；Release 里整块被优化掉） */
+static void ota_boot_mark(const char *tag)
+{
+#if defined(DEBUG)
+  char line[96];
+
+  (void)snprintf(line, sizeof(line), "[app] %s [free heap=%lu]\r\n",
+                 tag, (unsigned long)xPortGetFreeHeapSize());
+  OtaTrace_Text(line);
+#else
+  (void)tag;
+#endif
+}
 
 /* USER CODE END Application */
 

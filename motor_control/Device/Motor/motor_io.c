@@ -20,10 +20,13 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "motor_io.h"
+#include "uart_log.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
+
+#include <stdio.h>
 
 /* Private typedef -----------------------------------------------------------*/
 
@@ -42,26 +45,87 @@ static UART_HandleTypeDef *s_uart  = NULL;   /* 电机串口，MotorIo_Init 绑�
 static QueueHandle_t       s_queue = NULL;   /* 请求队列 */
 static TaskHandle_t        s_owner = NULL;   /* 收发任务自己，用来识别重入 */
 
+/* 最近一次清 RX 时「偰看」到的前几个字节：线上到底在发生什么，一看就知道
+   （全 00 / 全 FF = 线被拉低或电机没上电；有规律 = 电机一直在说话） */
+static uint8_t s_flush_sniff[MOTOR_IO_FLUSH_SNIFF_LEN];
+static uint8_t s_flush_sniff_len;
+
 /* Private functions ---------------------------------------------------------*/
 
 /**
   * @brief  清空串口接收，让每次一问一答都从干净状态开始
   * @note   上一轮超时/校验失败时可能还有半帧残留在 RX 里，不清掉下一轮就会错位；
   *         接收过程中出现的溢出/帧错误标志也一起清掉。
+  * @retval 实际丢掉的字节数（上限 MOTOR_IO_FLUSH_MAX_BYTES）
+  *
+  * ⚠⚠ 这里**绝对不能**写成 while (HAL_UART_Receive(...) == HAL_OK) {} ：
+  *   1) HAL_UART_Receive 的 timeout 只在「一个字节都收不到」时才生效，
+  *      一旦线上持续有数据，它就每次都立刻返回 HAL_OK；
+  *   2) 电机总线是单线 5V TTL（PE2/PE3 开漏 + 总线拉高），
+  *      电机没上电 / 总线被拉低 / 波特率不对时，USART 会把持续的
+  *      低电平当成连续起始位，按波特率源源不断产生帧错误字节。
+  *   两个加起来 ⇒ 那个 while 永远出不来，而且不报错、不断言，
+  *   表现就是「开机停在 MotorIo_Init 这里、串口一声不吭」。
+  *   所以这里用「直接看 RXNE 标志 + 硬上限」，清不掉就放弃（并打日志）。
   */
-static void MotorIo_FlushRx(void)
+static uint16_t MotorIo_FlushRx(void)
 {
-    uint8_t dummy;
+    uint16_t n = 0U;
 
-    /* 一字节一字节地读，读到读不出来了为止（残留不会太多） */
-    while (HAL_UART_Receive(s_uart, &dummy, 1U, 1U) == HAL_OK)
+    s_flush_sniff_len = 0U;
+
+    if (s_uart == NULL)
     {
-        /* 丢掉 */
+        return 0U;
+    }
+
+    while (n < MOTOR_IO_FLUSH_MAX_BYTES)
+    {
+        if (__HAL_UART_GET_FLAG(s_uart, UART_FLAG_RXNE) == RESET)
+        {
+            break;      /* 没有新字节了：正常出口 */
+        }
+
+        /* 读 RDR 就自动清了 RXNE，不用走 HAL 的加锁/状态机 */
+        uint8_t byte = (uint8_t)(s_uart->Instance->RDR & 0xFFU);
+
+        if (s_flush_sniff_len < MOTOR_IO_FLUSH_SNIFF_LEN)
+        {
+            s_flush_sniff[s_flush_sniff_len] = byte;
+            s_flush_sniff_len++;
+        }
+
+        n++;
     }
 
     s_uart->ErrorCode = HAL_UART_ERROR_NONE;
     __HAL_UART_CLEAR_FLAG(s_uart,
                           UART_CLEAR_OREF | UART_CLEAR_FEF | UART_CLEAR_NEF | UART_CLEAR_PEF);
+
+    return n;
+}
+
+/**
+  * @brief  清不干净时吐一行日志，把「线上到底是什么」也带上，方便直接定位硬件问题
+  */
+static void MotorIo_WarnDirtyRx(uint16_t flushed)
+{
+    char   line[256];
+    char   hex[3U * MOTOR_IO_FLUSH_SNIFF_LEN + 1U];
+    size_t k = 0U;
+
+    for (uint8_t i = 0U; i < s_flush_sniff_len; i++)
+    {
+        (void)snprintf(&hex[k], sizeof(hex) - k, "%02X ", s_flush_sniff[i]);
+        k += 3U;
+    }
+    hex[k] = '\0';
+
+    (void)snprintf(line, sizeof(line),
+                   "[motor] ⚠ 电机串口 RX 一直在收数据（清了 %u 字节，前 %u 字: %s）\r\n"
+                   "        线被拉低 / 电机没上电 / 波特率不对 —— 已放弃清理继续启动，不会卡在这里\r\n",
+                   (unsigned)flushed, (unsigned)s_flush_sniff_len, hex);
+    UartLog_Print(line);
 }
 
 /**
@@ -93,12 +157,27 @@ static uint8_t MotorIo_DoExchange(const uint8_t *tx, uint16_t tx_len,
 
 void MotorIo_Init(UART_HandleTypeDef *huart)
 {
+    char     line[96];
+    uint16_t flushed;
+
     s_uart  = huart;
     s_queue = xQueueCreate(MOTOR_IO_QUEUE_LEN, sizeof(MotorIoRequest));
 
-    if (s_uart != NULL)
+#if defined(DEBUG)
+    /* 分两步打：万一下一行出不来，就知道是死在「建队列」还是「清 RX」 */
+    UartLog_Print("[motor] io: queue created, flushing motor uart rx ...\r\n");
+#endif
+
+    flushed = MotorIo_FlushRx();
+
+    (void)snprintf(line, sizeof(line),
+                   "[motor] io ready (queue=%u, flushed=%u B)\r\n",
+                   (unsigned)((s_queue != NULL) ? 1U : 0U), (unsigned)flushed);
+    UartLog_Print(line);
+
+    if (flushed >= MOTOR_IO_FLUSH_MAX_BYTES)
     {
-        MotorIo_FlushRx();
+        MotorIo_WarnDirtyRx(flushed);
     }
 }
 

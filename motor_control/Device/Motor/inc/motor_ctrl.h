@@ -34,4 +34,20 @@ void MotorCtrl_Task(void *argument);
    ⚠ 跑在 FreeRTOS timer service task 里：绝对不能阻塞，只能释放信号量 */
 void MotorCtrl_OnPollTimer(void);
 
+/* ---- 无线控制入口（Device/Ota 的 OtaService 用） ----
+ * 这个口平时不打 OTA 时就是"控制信息"通道：
+ *   上位机发一帧 OTA_T_CTRL / OTA_T_STATUS，OtaService 转到这里执行。
+ * 返回 OTA_OK / OTA_E_xxx（见 Device/Ota/inc/ota_layout.h） */
+
+/* 进入/退出 OTA 模式：进入 = 电机失能 + 停轮询 + 禁止走动命令 */
+void    MotorCtrl_SetOtaMode(uint8_t on);
+uint8_t MotorCtrl_OtaMode(void);
+
+/* 控制命令：cmd = OTA_CTRL_xxx，arg 是参数，*out 回传附加信息 */
+uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out);
+
+/* 只读状态快照（0x74 + 0x75）：里程 / 位置原始值 / 故障码 / 当前模式 */
+uint8_t MotorCtrl_RemoteStatus(int32_t *mileage, uint16_t *position,
+                               uint8_t *fault, uint8_t *mode);
+
 #endif /* __MOTOR_CTRL_H__ */

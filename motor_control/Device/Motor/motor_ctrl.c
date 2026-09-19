@@ -23,9 +23,17 @@
 #include "uart_log.h"
 #include "ws2812.h"
 
+/* 无线控制命令的状态码（OTA_OK / OTA_E_xxx）和这个入口的约定在这里 */
+#include "ota_layout.h"
+#include "ota_trace.h"
+
+#include "FreeRTOS.h"
 #include "cmsis_os2.h"
 
 #include <stdio.h>
+
+/* 轮询定时器（在 Core/Src/freertos.c 里创建），升级期间要把它停下来 */
+extern osTimerId_t motorPosHandle;
 
 /* Private define ------------------------------------------------------------*/
 
@@ -145,6 +153,10 @@ static const osThreadAttr_t s_poll_task_attr =
    ⚠ LED 只由 MotorCtrl_Task 一个任务驱动：WS2812 走 SPI6，两个任务同时点灯
      会把帧打断。轮询任务只打日志，不碰灯。 */
 static WS2812_Color_t s_led_color = WS2812_COLOR_RED;
+
+/* 1 = 无线 OTA 升级中：电机强制失能、停轮询、禁止再命令走动。
+   由 OtaService 在会话开始/结束时置位/清除（见 MotorCtrl_SetOtaMode） */
+static uint8_t s_ota_mode = 0U;
 
 /* Private function prototypes -----------------------------------------------*/
 static void           MotorCtrl_PollTask(void *argument);
@@ -280,6 +292,13 @@ static uint8_t MotorCtrl_DelayOrKeyPress(uint32_t ms)
 {
     for (uint32_t waited = 0U; waited < ms; waited += KEY_POLL_MS)
     {
+        /* 升级中（otaSvc 起了会话）：当成"被打断"，让主流程赶紧退回等按键，
+           别再往总线上发动作命令 */
+        if (s_ota_mode != 0U)
+        {
+            return 1U;
+        }
+
         if (MotorCtrl_KeyPressed() != 0U)
         {
             return 1U;
@@ -678,6 +697,13 @@ static uint8_t MotorCtrl_MoveToPosition(uint16_t position, const char *tag)
     char          hex[MOTOR_HEX_SIZE];
     char          fault_text[48];
 
+    /* 升级中：绝对不能让电机转起来（正在擦写 Flash，而且没人看护） */
+    if (s_ota_mode != 0U)
+    {
+        UartLog_Print("motor: OTA in progress, move ignored\r\n");
+        return 0U;
+    }
+
     uint8_t ok = Motor_SetValue(motor_ids[0], (int16_t)position,
                                 MOTOR_MOVE_ACCEL_TIME, MOTOR_MOVE_BRAKE, &ack);
 
@@ -806,11 +832,172 @@ void MotorCtrl_OnPollTimer(void)
     }
 }
 
+/* ---- 无线控制入口（OtaService 用：OTA 平时就是靠这个口传控制信息） -------- */
+
+/*
+ * 进入/退出"OTA 模式"：
+ *   进入 = 电机全部失能 + 停 200 ms 轮询 + 禁止后续走动命令
+ *   退出 = 恢复轮询（电机仍然保持失能，要动就再按键/发 ENABLE）
+ */
+void MotorCtrl_SetOtaMode(uint8_t on)
+{
+    if ((on != 0U) && (s_ota_mode == 0U))
+    {
+        s_ota_mode = 1U;
+
+        MotorCtrl_DisableAll();                       /* 先失能：升级期间电机必须不使劲 */
+        (void)osTimerStop(motorPosHandle);            /* 停轮询，别和 OTA 抢带宽 */
+    }
+    else if ((on == 0U) && (s_ota_mode != 0U))
+    {
+        s_ota_mode = 0U;
+
+        (void)osTimerStart(motorPosHandle, pdMS_TO_TICKS(MOTOR_CTRL_POLL_MS));
+    }
+}
+
+uint8_t MotorCtrl_OtaMode(void)
+{
+    return s_ota_mode;
+}
+
+/*
+ * 无线控制命令：上位机发 OTA_T_CTRL，payload[0] = cmd、payload[1..4] = arg。
+ * 返回 OTA_OK 或 OTA_E_xxx（见 ota_layout.h），*out 是给上位机看的附加信息。
+ */
+uint8_t MotorCtrl_RemoteCmd(uint8_t cmd, uint32_t arg, uint32_t *out)
+{
+    MotorMode ack;
+    uint8_t   ok = 1U;
+
+    if (out != NULL)
+    {
+        *out = 0U;
+    }
+
+    /* 升级期间只允许"失能 / 急停 / 静音 / 停轮询"，别的都拒绝 ——
+       正在擦写 Flash 的时候让电机转起来是找死 */
+    if ((s_ota_mode != 0U) && (cmd != OTA_CTRL_DISABLE) && (cmd != OTA_CTRL_STOP) &&
+        (cmd != OTA_CTRL_LOG_MUTE) && (cmd != OTA_CTRL_POLL_PAUSE))
+    {
+        return OTA_E_NOTALLOWED;
+    }
+
+    switch (cmd)
+    {
+        case OTA_CTRL_DISABLE:
+            MotorCtrl_DisableAll();
+            break;
+
+        case OTA_CTRL_ENABLE:
+            if (MotorCtrl_Enable(motor_ids[0], &ack) == 0U)
+            {
+                ok = 0U;
+            }
+            break;
+
+        case OTA_CTRL_POS_LOOP:
+            /* 只看回帧不够（不认 0x03 的固件也会回合法的 0xA1），必须确认模式值真是 0x03 */
+            if ((MotorCtrl_EnterPositionLoop(&ack) == 0U) || (ack.mode != MOTOR_MODE_POSITION))
+            {
+                ok = 0U;
+            }
+            break;
+
+        case OTA_CTRL_MOVE_POS:
+            if (arg > 32767U)
+            {
+                return OTA_E_PARAM;
+            }
+            if (MotorCtrl_MoveToPosition((uint16_t)arg, "remote move (0x64)") == 0U)
+            {
+                ok = 0U;
+            }
+            break;
+
+        case OTA_CTRL_MOVE_DEG:
+            if (arg > 359U)
+            {
+                return OTA_E_PARAM;
+            }
+            if (MotorCtrl_MoveToPosition(Motor_AngleToPosition((uint16_t)arg),
+                                         "remote move (deg)") == 0U)
+            {
+                ok = 0U;
+            }
+            break;
+
+        case OTA_CTRL_STOP:
+            MotorCtrl_Stop(motor_ids[0]);      /* 0x64 给定值 0 = 急停 */
+            break;
+
+        case OTA_CTRL_LOG_MUTE:
+            UartLog_SetEnabled((arg != 0U) ? 0U : 1U);
+            break;
+
+        case OTA_CTRL_POLL_PAUSE:
+            if (arg != 0U)
+            {
+                (void)osTimerStop(motorPosHandle);
+            }
+            else
+            {
+                (void)osTimerStart(motorPosHandle, pdMS_TO_TICKS(MOTOR_CTRL_POLL_MS));
+            }
+            break;
+
+        default:
+            return OTA_E_PARAM;
+    }
+
+    return (ok != 0U) ? (uint8_t)OTA_OK : (uint8_t)OTA_E_STATE;
+}
+
+/*
+ * 只读状态快照：0x74（里程/位置/故障码）+ 0x75（当前模式）。
+ * 比"一问一答 + 文本日志"更适合上位机画曲线。
+ */
+uint8_t MotorCtrl_RemoteStatus(int32_t *mileage, uint16_t *position,
+                               uint8_t *fault, uint8_t *mode)
+{
+    MotorStatus status;
+    MotorMode   mode_ack;
+
+    if ((mileage == NULL) || (position == NULL) || (fault == NULL) || (mode == NULL))
+    {
+        return OTA_E_PARAM;
+    }
+
+    if (Motor_QueryStatus(motor_ids[0], &status) == 0U)
+    {
+        return OTA_E_STATE;    /* 电机没答上（没上电/没接线） */
+    }
+
+    *mileage  = status.mileage;
+    *position = status.position;
+    *fault    = status.fault;
+
+    if (Motor_QueryMode(motor_ids[0], &mode_ack) != 0U)
+    {
+        *mode = mode_ack.mode;
+    }
+    else
+    {
+        *mode = MOTOR_MODE_UNKNOWN;
+    }
+
+    return OTA_OK;
+}
+
 void MotorCtrl_Task(void *argument)
 {
     char line[MOTOR_LINE_SIZE];
 
     (void)argument;
+
+    /* 启动诊断：能打到这里说明调度器起来了、任务在跑。
+       如果这个 J 出来了但下面 UartLog_Print 的正文没出来 → 问题在日志口（USART1）。 */
+    OtaTrace_Text("[app] J: defaultTask (MotorCtrl_Task) running\r\n");
 
     UartLog_Print("motor control (FreeRTOS): USART10 38400, press USER_KEY (PA15) to start\r\n");
 

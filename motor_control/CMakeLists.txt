@@ -32,6 +32,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 project(${CMAKE_PROJECT_NAME})
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
+# ---------------------------------------------------------------------------
+# 链接脚本 / map 文件的名字
+#
+# 工具链文件 cmake/gcc-arm-none-eabi.cmake（CubeMX 生成，每次 Generate Code 都会重写）
+# 里面写死了两项：-T STM32H723xG_flash.ld 和 -Wl,-Map=<工程名>.map。这里都摘掉：
+#   - 链接脚本换成我们自己的 STM32H723xG_slots.ld，镜像基址用
+#     -Wl,--defsym=APP_BASE=... 传进去（App-A / App-B / Bootloader 基址不同，
+#     具体在 cmake/ota.cmake 里按目标设置）；
+#   - map 名字按目标生成，不然后面加的两个 App 会往同一个文件里写。
+# 用"事后修剪"而不是去改工具链文件，就是为了让 Generate Code 覆盖不掉。
+# ---------------------------------------------------------------------------
+string(REGEX REPLACE "-T +\"[^\"]*STM32H723xG_flash\\.ld\"" "" OTA_LINK_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+string(REGEX REPLACE "-Wl,-Map=[^ ]+" "" OTA_LINK_FLAGS "${OTA_LINK_FLAGS}")
+string(STRIP "${OTA_LINK_FLAGS}" CMAKE_EXE_LINKER_FLAGS)
+
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 
@@ -72,6 +87,8 @@ include(cmake/ws2812.cmake)
 include(cmake/uart_log.cmake)
 include(cmake/motor.cmake)
 include(cmake/motor_ctrl.cmake)
+# 无线 OTA：ota_core/ota_service + 三个镜像目标（App-A / App-B / Bootloader）
+include(cmake/ota.cmake)
 
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
