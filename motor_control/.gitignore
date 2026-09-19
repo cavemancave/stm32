@@ -1,3 +1,7 @@
 build
 mx.scratch
 !.settings
+
+# 厂商 PDF 手册（如 docs/M0603A_111_motor_specification_cn.pdf）：
+# 不入本库，后续用单独的仓库跟踪
+docs/*.pdf
