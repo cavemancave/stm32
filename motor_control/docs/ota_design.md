@@ -461,6 +461,7 @@ tools/ota.py          上位机：查询 / 升级 / 续传 / 回滚 / 监视日�
 python tools/ota.py selftest                         # 先跑这个：不连板子，自检 CRC32/COBS/组帧
 python tools/ota.py --port COM7 info                 # 看当前在哪个槽、版本、CRC
 python tools/ota.py --port COM7 flash build/Debug/motor_control_slotB.bin
+python tools/ota.py --port COM7 upgrade        # 不带文件：自动挑槽 + 自动挑镜像（日常就用这个）
 python tools/ota.py --port COM7 rollback             # 新固件有问题 → 切回旧槽
 python tools/ota.py --port COM7 reboot --boot        # 重启进 Bootloader 恢复台（救砖）
 python tools/ota.py --port COM7 monitor              # 当串口监视器看日志

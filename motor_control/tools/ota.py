@@ -7,6 +7,7 @@
 
 用法（COM7 是电脑这边配对的无线串口）：
     python tools/ota.py --port COM7 info                    # 看当前在哪个槽、版本、CRC
+    python tools/ota.py --port COM7 upgrade                 # ★一条命令升级：自动挑槽 + 自动挑镜像
     python tools/ota.py --port COM7 flash build/Debug/motor_control_slotB.bin
     python tools/ota.py --port COM7 monitor                 # 当串口监视器看日志
     python tools/ota.py --port COM7 rollback                # 新固件有问题 → 切回旧槽
@@ -53,6 +54,15 @@ FRAME_OVERHEAD = 11                     # SYNC2 + VER + TYPE + SEQ + LEN2 + CRC4
 SLOT_A_BASE = 0x08020000
 SLOT_B_BASE = 0x08080000
 SLOT_SIZE = 384 * 1024
+
+# 构建产物目录：按**脚本所在位置**算，不从当前目录算 ——
+# 这样在仓库根目录、在 tools/ 里、或者从别的地方调用都不会找不到 .bin。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
+BUILD_DIR = os.path.join(_REPO, "build", "Debug")
+
+# 两个槽对应的镜像文件名（同一份源码按不同基址链接出来的两份）
+IMAGE_FOR_SLOT = {0: "motor_control.bin", 1: "motor_control_slotB.bin"}
 
 T_INFO, T_BEGIN, T_DATA, T_END = 0x01, 0x02, 0x03, 0x04
 T_ABORT, T_REBOOT, T_ERASE, T_ROLLBACK = 0x05, 0x06, 0x07, 0x08
@@ -341,17 +351,8 @@ def cmd_flash(dev: Device, args):
     in_bl = bool(info["flags"] & 0x80)          # 1 = 设备在 Bootloader 恢复台里
     running = info["active"] if info["active"] < 2 else 0
 
-    # 目标槽：默认 = 不是"正在跑"的那个（A/B 双槽，永远不动正在跑的那个）；
-    # 恢复台里没有 App 在跑，默认就写元数据里的 active 槽（也就是跑不起来的那个）
-    if args.slot == "auto":
-        if in_bl:
-            target = running
-        elif info["pending"] < 2:
-            target = info["pending"]        # 上次没切成功，接着写同一个槽
-        else:
-            target = 1 - running
-    else:
-        target = 0 if args.slot.upper() == "A" else 1
+    # 目标槽：规则见 pick_target_slot()（和 upgrade 共用同一份逻辑，不会两边跑偏）
+    target = pick_target_slot(info, args.slot)
 
     if (target == running) and not in_bl:
         raise OtaError(
@@ -452,6 +453,65 @@ def cmd_flash(dev: Device, args):
               "或者 `reboot --boot` 进恢复台、`rollback` 切回旧槽")
     else:
         print("  （可以用 `info` 确认新版本，用 `rollback` 切回旧槽）")
+
+
+def image_path_for_slot(slot: int) -> str:
+    """这个槽该用哪份 .bin"""
+    return os.path.join(BUILD_DIR, IMAGE_FOR_SLOT[slot])
+
+
+def pick_target_slot(info: dict, slot_arg: str = "auto") -> int:
+    """目标槽 = 要写哪个槽。规则和 cmd_flash 里完全一样，flash / upgrade 共用：
+       - 指定了 A/B → 就写那个；
+       - 设备在 BL 恢复台 → 写元数据里的 active 槽（就是跑不起来的那个）；
+       - 上次切槽没成功（pending 还在）→ 接着写同一个槽；
+       - 否则 → 写另一个槽（永远不碰正在跑的那个）。
+    """
+    running = info["active"] if info["active"] < 2 else 0
+    in_bl = bool(info["flags"] & 0x80)
+
+    if slot_arg != "auto":
+        return 0 if slot_arg.upper() == "A" else 1
+    if in_bl:
+        return running
+    if info["pending"] < 2:
+        return info["pending"]
+    return 1 - running
+
+
+def cmd_upgrade(dev: Device, args):
+    """和 flash 完全一样，唯一区别：**不带文件时自动挑**。
+
+    先问设备现在跑在哪个槽，再发另一个槽对应的那份 .bin：
+        A 槽在跑 → 发 motor_control_slotB.bin（写 B 槽）
+        B 槽在跑 → 发 motor_control.bin（写 A 槽）
+    所以升级成功后，再跑一次 upgrade 就会切回另一个槽 —— 交替升级，两个槽都是当前构建。
+    """
+    if args.file is None:
+        info = dev.get_info()
+        in_bl = bool(info["flags"] & 0x80)
+        running = info["active"] if info["active"] < 2 else 0
+        target = pick_target_slot(info, args.slot)
+        path = image_path_for_slot(target)
+
+        if not os.path.exists(path):
+            raise OtaError(
+                f"自动挑出来的镜像是 {path}，但文件不存在。\n"
+                f"  先构建一次（三个镜像都会生成），或者手动指定：upgrade <file.bin>")
+
+        print(f"设备{'在 Bootloader 恢复台' if in_bl else f'跑在槽 {slot_name(running)}'}"
+              f" → 写入槽 {slot_name(target)}，自动选镜像 {os.path.basename(path)}")
+
+        # 顺手提醒一句：目标槽里已经是同一份镜像时不拦，但先说一声（省得看着进度条以为坏了）
+        same = info["slot"][target]
+        crc = zlib.crc32(open(path, "rb").read()) & 0xFFFFFFFF
+        if same["size"] and same["crc"] == crc:
+            print(f"  注意：槽 {slot_name(target)} 里已经是同一份镜像（crc32 一致）—— "
+                  f"传一遍只是确认，源码没变的话结果不会变")
+
+        args.file = path
+
+    return cmd_flash(dev, args)
 
 
 def cmd_rollback(dev: Device, args):
@@ -556,7 +616,7 @@ def cmd_selftest(dev, args):
     found = False
     for f, want in (("motor_control.bin", 0), ("motor_control_slotB.bin", 1),
                     ("motor_boot.bin", None)):
-        path = os.path.join("build", "Debug", f)
+        path = os.path.join(BUILD_DIR, f)
         if not os.path.exists(path):
             continue
         img = open(path, "rb").read()
@@ -584,21 +644,31 @@ def main():
 
     sub = ap.add_subparsers(dest="action", required=True)
 
+    # flash / upgrade 共用的参数（upgrade 只是"文件可以不填"）
+    flash_args = argparse.ArgumentParser(add_help=False)
+    flash_args.add_argument("--slot", default="auto", help="auto（默认，写非活动槽）/ A / B")
+    flash_args.add_argument("--chunk", type=int, default=1024, help="每包字节数，默认 1024")
+    flash_args.add_argument("--retries", type=int, default=5, help="每一包的重传次数")
+    flash_args.add_argument("--force", action="store_true", help="强制重新擦除，不续传")
+    flash_args.add_argument("--version", type=lambda s: int(s, 0), default=None,
+                            help="版本号，如 0x00010200")
+    flash_args.add_argument("--no-wait-boot", dest="wait_boot", action="store_false",
+                            help="升完不等设备重启确认（默认会等并打印新状态）")
+
     sub.add_parser("selftest", help="不连板子，自检 CRC32/COBS/组帧").set_defaults(func=cmd_selftest)
 
     sub.add_parser("info", help="查看分区/版本/CRC 状态").set_defaults(func=cmd_info)
     sub.add_parser("monitor", help="当串口监视器，看设备日志").set_defaults(func=cmd_monitor)
 
-    p = sub.add_parser("flash", help="升级固件（自动挑槽、支持续传）")
+    p = sub.add_parser("flash", parents=[flash_args], help="升级固件（自动挑槽、支持续传）")
     p.add_argument("file", help="build/Debug/motor_control.bin 或 motor_control_slotB.bin")
-    p.add_argument("--slot", default="auto", help="auto（默认，写非活动槽）/ A / B")
-    p.add_argument("--chunk", type=int, default=1024, help="每包字节数，默认 1024")
-    p.add_argument("--retries", type=int, default=5, help="每一包的重传次数")
-    p.add_argument("--force", action="store_true", help="强制重新擦除，不续传")
-    p.add_argument("--version", type=lambda s: int(s, 0), default=None, help="版本号，如 0x00010200")
-    p.add_argument("--no-wait-boot", dest="wait_boot", action="store_false",
-                   help="升完不等设备重启确认（默认会等并打印新状态）")
     p.set_defaults(func=cmd_flash, wait_boot=True)
+
+    p = sub.add_parser("upgrade", parents=[flash_args],
+                       help="一条命令升级：自动看设备在哪个槽，发另一个槽对应的 .bin（文件可省）")
+    p.add_argument("file", nargs="?", default=None,
+                   help="可省；不填就自动挑 motor_control.bin（A 槽）/ motor_control_slotB.bin（B 槽）")
+    p.set_defaults(func=cmd_upgrade, wait_boot=True)
 
     sub.add_parser("rollback", help="切回另一个槽并重启").set_defaults(func=cmd_rollback)
     sub.add_parser("status", help="电机里程/位置/故障码").set_defaults(func=cmd_status)

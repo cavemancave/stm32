@@ -211,6 +211,7 @@ App 跑满 2 s 后把自己登记到元数据里（长度 + CRC32 + 版本），
 ```bash
 pip install pyserial
 python tools/ota.py --port COM7 info                       # 看当前在哪个槽、版本、两个槽的 CRC
+python tools/ota.py --port COM7 upgrade                    # ★一条命令升级：自动挑槽 + 自动挑镜像
 python tools/ota.py --port COM7 flash build/Debug/motor_control_slotB.bin
 python tools/ota.py --port COM7 rollback                   # 新固件有问题 → 一键切回旧槽
 python tools/ota.py --port COM7 reboot --boot              # 手动进 Bootloader 恢复台（救砖）
@@ -224,6 +225,12 @@ python tools/ota.py --port COM7 ctrl pwcycle               # 断电重启电机�
 
 `flash` 会自动挑槽（写在非活动槽）并**检查你给的 .bin 是给哪个槽编的**
 （.bin 里的复位向量一看就知道），给错了直接拒练，避免把 A 的镜像写进 B 槽、跳过去必崩。
+
+**`upgrade` 比 `flash` 更省事**：不带文件时会先问设备「现在跑在哪个槽」，再发**另一个槽**
+对应的那份 `.bin`（A 槽在跑就发 `motor_control_slotB.bin`，反之发 `motor_control.bin`）。
+所以日常升级就是一条命令；升级成功后设备切到另一个槽，**再跑一次 `upgrade` 又会切回来** ——
+两个槽永远都是当前构建（`upgrade` 之后想回旧的用 `rollback`）。
+也能显式指定：`upgrade --slot B`、`upgrade 某个.bin --force`（参数和 `flash` 完全一样）。
 
 ### 关于 CRC32：设备算的是「Flash 内容」，不是「.bin 文件」
 
