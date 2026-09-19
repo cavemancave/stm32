@@ -330,7 +330,7 @@ cube-cmake --preset Debug && ninja -C build/Debug      # Release 换成 --preset
 | 功能 | 引脚 |
 | --- | --- |
 | 可控 5V 使能（`Power_5V_EN`，高有效） | **PC15** |
-| **电机电源使能（`Motor_Pwr_EN`，高有效）** | **PC14** |
+| **电机电源使能（`VCC_OUT1_EN`，高有效）** | **PC14** |
 | 用户按键 `USER_KEY`（触发电机使能） | **PA15**（输入，无上下拉；按下为低电平。默认是 JTDI，配成 GPIO 后只能用 SWD 调试） |
 | BMI088 加速度片选 / 陀螺片选 | PC0 / PC3 |
 | SPI2：SCK / MOSI / MISO | PB13 / PC1 / PC2_C |

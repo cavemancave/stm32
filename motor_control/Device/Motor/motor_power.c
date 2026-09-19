@@ -20,13 +20,14 @@
 
 #include <stdio.h>
 
-/* PC14 的引脚定义：CubeMX 生成之后用生成出来的宏（main.h 的 Motor_Pwr_EN_Pin），
-   还没生成（.ioc 刚改、没跑 Generate Code）就用下面这对兜底，保证代码立刻能编译能跑。
-   ⚠ 以后在 CubeMX 里换引脚时，记得这里的兜底也要改（或者干脆重新生成一次代码，
-     让它走上面那个宏）。 */
-#if defined(Motor_Pwr_EN_Pin)
-#define MOTOR_PWR_PORT      Motor_Pwr_EN_GPIO_Port
-#define MOTOR_PWR_PIN       Motor_Pwr_EN_Pin
+/* PC14 的引脚定义：CubeMX 生成之后用生成出来的宏（main.h 里按标签生成：
+   VCC_OUT1_EN_Pin / VCC_OUT1_EN_GPIO_Port），还没生成（.ioc 刚改、没跑 Generate Code）
+   就用下面这对兜底，保证代码立刻能编译能跑。
+   ⚠ 以后在 CubeMX 里换引脚（或改标签）时，记得这里的兜底也要改；
+     或者干脆重新生成一次代码，让它走上面那个宏。 */
+#if defined(VCC_OUT1_EN_Pin)
+#define MOTOR_PWR_PORT      VCC_OUT1_EN_GPIO_Port
+#define MOTOR_PWR_PIN       VCC_OUT1_EN_Pin
 #else
 #define MOTOR_PWR_PORT      GPIOC
 #define MOTOR_PWR_PIN       GPIO_PIN_14
@@ -90,7 +91,7 @@ void MotorPwr_Enable(uint8_t on)
     motor_pwr_write(on);
     s_on = on;
 
-    (void)snprintf(line, sizeof(line), "[motor] power %s (PC14 -> %s)\r\n",
+    (void)snprintf(line, sizeof(line), "[motor] power %s (PC14/VCC_OUT1_EN -> %s)\r\n",
                    (on != 0U) ? "ON" : "OFF", (on != 0U) ? "high (enabled)" : "low (cut)");
     UartLog_Print(line);
 }
