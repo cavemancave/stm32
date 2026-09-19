@@ -479,6 +479,27 @@ python tools/ota.py --port COM7 ctrl disable         # 电机控制：disable/en
 5. `Core/Src/freertos.c` 里我们的改动只在 `USER CODE` 段内（日志口换成 USART1、
    建 OTA 任务），CubeMX 不会覆盖。
 6. `Core/Src/main.c` 里只多了一行 `SCB->VTOR = ...`（`USER CODE BEGIN 1`），同样在 USER CODE 段内。
+7. **CubeMX 拥有的 RTOS 开关现在有编译期护栏**（`Core/Inc/FreeRTOSConfig.h` 的 `USER CODE BEGIN 1`）：
+   `configTOTAL_HEAP_SIZE` / `configMAX_PRIORITIES` / `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` /
+   `configUSE_TIMERS` / `configUSE_MUTEXES` / `configSUPPORT_{STATIC,DYNAMIC}_ALLOCATION`
+   这些**都不在 USER CODE 段里**，`.ioc` 里也没有显式记录（`FREERTOS.IPParameters` 只有
+   Tasks01 / FootprintOK / Timers01）——也就是说重新生成时它们可能被改掉，而后果是
+   "启动时某个 `osThreadNew` / `xQueueCreate` 失败、卡在 `freertos.c` 里一声不吭" 这种极难查的形
+   （实测 15360 里启动后只剩 ~7 KB）。现在对不上就直接**编译不过**（`_Static_assert`）。
+   ⚠ 唯一天然查不了的是 `configTICK_RATE_HZ`：它的值写成 `((TickType_t)1000)`，
+   而包含本文件时 `TickType_t` 还没定义，预处理和 `_Static_assert` 都过不去；只能靠人看**保持 1000 Hz**。
+8. **PE2（USART10_RX）的内部上拉**目前写在 `Core/Src/usart.c` 的
+   `USER CODE BEGIN USART10_MspInit 1`（电机没接时 RX 悬空会被噪声刷出假字节，见 §7 第 20 条）。
+   它随 USER CODE 一起保留，但 CubeMX 的引脚模型里没有它 —— 想"正规"一点就在 CubeMX 里
+   设 PE2 → Pull-up，然后把手写那段删掉（两者同时存在只是多初始化一次，无害）。
+9. 重新生成后**确认这四项没变**：PE3 = USART10_TX + **Open Drain**、PE2 = USART10_RX、
+   PA9/PA10 保持未分配、USART10 波特率 38400；以及 **`NVIC.TimeBase` 仍是 TIM6**（`SYS` 的
+   Timebase Source = TIM6，SysTick 留给 FreeRTOS）。任何一项错了，电机总线、无线口、
+   或者整个系统的节拍就会出问题 —— 尤其 Timebase 如果被改回 SysTick，
+   `HAL_InitTick` 就会变成 HAL 的弱实现，和 FreeRTOS 的 SysTick 抢中断（见 §7 第 12 条）。
+10. 生成完的**验证流程**：重新编译 → 烧 `motor_control.hex` → 看串口里
+    `[app] I2: all threads created -> start scheduler [free heap=7288]`（应该还有 7 KB 上下）。
+    这个数字掉到很小或者干脆卡在 `H3/H4` 之间，就是某个 CubeMX 开关被改了（见第 7 条）。
 
 ---
 

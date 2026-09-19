@@ -153,6 +153,35 @@ See http://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html. */
 /* Normal assert() semantics without relying on the provision of an assert.h
 header file. */
 /* USER CODE BEGIN 1 */
+/*
+ * ⚠⚠ 这一段是"CubeMX 拥有、但本工程强依赖"的那几个开关的**编译期护栏**。
+ *
+ * 下面这些 `configXxx` 都**不在 USER CODE 段里**（归 CubeMX 管），而 `.ioc` 里也没有
+ * 显式记着它们的值（`FREERTOS.IPParameters` 只有 Tasks01 / FootprintOK / Timers01），
+ * 也就是说：重新 Generate Code 时它们有可能被改成别的值，而后果都极难查：
+ *   - 堆变小  → 启动时某个 osThreadNew / xQueueCreate 失败 → 卡在 freertos.c 里一声不吭
+ *               （实测 15360 里启动后只剩 7288，8192 就不够）；
+ *   - 系统调用中断优先级变了 → Device/Ota/ota_com.c 里把 USART1 中断配在 5，
+ *               它就不再是"可以安全调 ...FromISR"的合法值 → 偶发 HardFault；
+ *   - 定时器 / 互斥量 / 静态分配被关掉 → 直接编译不过或运行时出问题。
+ * 所以就地钉住：对不上就**编译不过**，而不是上板子猜。
+ * （用 _Static_assert 而不是 #if：configTOTAL_HEAP_SIZE 里有 `(size_t)` 强制转换，
+ *   预处理器看不懂，会直接报语法错。
+ *   ⚠ configTICK_RATE_HZ 这里**查不了**：它的值写成 `((TickType_t)1000)`，而包含这个头的时候
+ *   TickType_t 还没定义（FreeRTOS.h 在包含本文件之后才定义它），预处理和 _Static_assert 都过不去。
+ *   所以节拍频率只能靠人看：CubeMX 里要保持 1000 Hz（上层所有 pdMS_TO_TICKS/延时都按 1 ms 算）。）
+ */
+_Static_assert(configTOTAL_HEAP_SIZE >= 15360,
+               "configTOTAL_HEAP_SIZE 被改小了：本工程启动后只剩 ~7 KB，需要 >= 15360");
+_Static_assert(configMAX_PRIORITIES >= 56,
+               "configMAX_PRIORITIES 必须 >= 56（CMSIS-RTOS2 的 osPriority 有 56 级）");
+_Static_assert(configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY == 5,
+               "这个优先级必须是 5：ota_com.c 里 USART1 中断就配在 5，改了就不再安全");
+_Static_assert(configUSE_TIMERS == 1, "motorPos 是 osTimerPeriodic，configUSE_TIMERS 必须是 1");
+_Static_assert(configUSE_MUTEXES == 1, "UartLog 用了 osMutexNew，configUSE_MUTEXES 必须是 1");
+_Static_assert(configSUPPORT_STATIC_ALLOCATION == 1, "motorPos / timer 队列用静态分配");
+_Static_assert(configSUPPORT_DYNAMIC_ALLOCATION == 1, "线程/队列/互斥量都是动态创建");
+
 /* 断言失败先把"哪一条、在哪个文件哪一行"打出来再死循环（OtaTrace_AssertFailed 用裸寄存器发，
    不依赖 HAL/tick，见 Device/Ota/src/ota_trace.c）—— 比"一片安静"好查一万倍。
    ⚠ 这里用 extern 声明而不是 #include：FreeRTOS 自己的 .c 文件没有我们的 include 路径。
