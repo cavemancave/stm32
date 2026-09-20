@@ -24,6 +24,9 @@
    周期在 freertos.c 的 osTimerStart(motorPosHandle, ...) 里用它设定 */
 #define MOTOR_CTRL_POLL_MS        200U
 
+/* 模式查询（0x75）没答上时的返回值：0xFF 不可能是合法模式值 */
+#define MOTOR_MODE_UNKNOWN        0xFFU
+
 /* 建轮询信号量 + 轮询任务。必须在 osKernelInitialize() 之后调用 */
 void MotorCtrl_Init(void);
 
@@ -43,7 +46,8 @@ void MotorCtrl_OnPollTimer(void);
 void    MotorCtrl_SetOtaMode(uint8_t on);
 uint8_t MotorCtrl_OtaMode(void);
 
-/* 控制命令：cmd = OTA_CTRL_xxx，arg 是参数，*out 回传附加信息。
+/* 控制命令：cmd = OTA_CTRL_xxx，arg 是参数，out/out2/out3 回传三个附加信息
+ * （对应无线回帧里的 data / data2 / data3；后两个可以传 NULL）。
  *
  * motor_index = 电机序号（= motor_ids[] 里的下标 +1，也就是“1 号机 / 2 号机”，不是总线 ID）：
  *   0            = 没指定。安全类命令（失能/急停）作用于**全部**；
@@ -51,12 +55,38 @@ uint8_t MotorCtrl_OtaMode(void);
  *   1..MOTOR_COUNT = 只作用于那一台。
  * 序号越界返回 OTA_E_PARAM。
  * ⚠ 单台失能不会切电源（两台共用一路电源，另一台可能还在干活）；
- *   “失能全部”（motor_index = 0）才会把 PC14 那一路电也断掉。 */
-uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg, uint32_t *out);
+ *   “失能全部”（motor_index = 0）才会把 PC14 那一路电也断掉。
+ * ⚠ **跟随在跑的时候，任何手动命令都会先把跟随停掉**（除了 FOLLOW/SPIN 自己）：
+ *   否则跟随循环下一拍就把电机拽回目标位置，急停/失能会“按不住”。 */
+uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg,
+                            uint32_t *out, uint32_t *out2, uint32_t *out3);
 
 /* 只读状态快照（0x74 + 0x75）：里程 / 位置原始值 / 故障码 / 当前模式。
    motor_index 含义同上（0 = 1 号机） */
 uint8_t MotorCtrl_RemoteStatus(uint8_t motor_index, int32_t *mileage, uint16_t *position,
                                uint8_t *fault, uint8_t *mode);
+
+/* ---- 给跟随模块（motor_follow.c）用的内部工具 ----
+ * 跟随循环要用到的“使能 / 切位置环 / 急停 / 停轮询”都已经在这里实现过一遍了，
+ * 直接复用，免得两套实现以后各自漂移。 */
+
+/* 无线命令里的“电机序号”（1 起）→ 总线 ID（帧首字节）；越界返回 0 */
+uint8_t MotorCtrl_MotorIdOfIndex(uint8_t index);
+
+/* 查一次模式值（0x75 -> 0x76），**不打日志**：跟随模块判断“要不要重新配位置环”用。
+   查不到（超时/不答）返回 MOTOR_MODE_UNKNOWN */
+uint8_t MotorCtrl_QueryModeValue(uint8_t motor_id);
+
+/* 把一台电机弄进位置环：使能（自带重试）→ 0xA0/0x03 → 0x75 复核模式值真是 0x03。
+   返回 1 = 已在位置环（过程打日志）；0 = 没成功（原因在日志里） */
+uint8_t MotorCtrl_PreparePositionLoop(uint8_t motor_id);
+
+/* 急停两台（0x64 给定值 0）→ 失能两台 → 切 PC14 电源。
+   给跟随模块的“出事就停”和别的地方的异常回退用。 */
+void    MotorCtrl_SafeStopAll(void);
+
+/* 暂停 / 恢复 200 ms 状态轮询（内部计数，可以嵌套：OTA 会话和跟随各停一次，
+   两边都恢复了才开始轮询 —— 否则先恢复的那个会把轮询开回来抢总线）。 */
+void    MotorCtrl_PollPause(uint8_t on);
 
 #endif /* __MOTOR_CTRL_H__ */

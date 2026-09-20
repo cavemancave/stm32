@@ -35,8 +35,20 @@
 #include <string.h>
 
 /* 任务栈（字节，CMSIS-RTOS2 的 stack_size 单位是字节）。
-   里面有 snprintf（一百多字节）+ HAL 调用，留 2 KB */
-#define OTA_SVC_TASK_STACK      (512U * 4U)
+   里面有 snprintf（一百多字节）+ HAL 调用，留 2 KB。
+
+   ⚠⚠ **改成 3 KB 是实测逼出来的**（2026-09-20）：无线命令这条链很深：
+     OtaService_Task → OnFrame → Ctrl → MotorCtrl_RemoteCmd → 位置跟随
+     → MotorCtrl_PreparePositionLoop → EnterPositionLoop → 日志格式化
+     → Motor_QueryMode → Motor_Transaction → MotorIo_Exchange → xQueueSend
+     按 -fstack-usage 的实测帧大小加起来 ~1.7 KB（还没算 newlib 的 snprintf
+     和中断栈帧）。
+     2 KB 时**刚好溢出**，而症状不是崩溃：栈往低地址长，把堆里紧挨着的
+     UartLog 互斥量的 Queue_t 写坏了 → 下一次 UartLog_Lock 在
+     queue.c 里撞上 `pxQueue->uxItemSize == 0` 断言。
+     ⇒ 加命令/加深调用链之前先算一下栈（`-fstack-usage` 会生成 .su 文件），
+       跑起来后用 `ctrl stacks` 看每个任务还剩多少。 */
+#define OTA_SVC_TASK_STACK      (512U * 6U)
 
 /* Private variables ---------------------------------------------------------*/
 
@@ -223,6 +235,61 @@ static void OtaService_ConfirmBoot(void)
 
 /* ---- 控制命令（不升级时的"控制信息"通道） --------------------------------- */
 
+/* 栈余量最多打几个任务（本工程 7 个上下，留点余量） */
+#define OTA_STACK_DUMP_MAX   12U
+
+/*
+ * 把每个任务的"栈余量"打进日志：uxTaskGetStackHighWaterMark 给出的是**历史最深**
+ * 用到的地方离栈尾还剩多少（这里换算成字节，越大越安全）。
+ *
+ * ⚠ 为什么值得专门做个命令：**栈溢出是不出声的** —— 它只把栈下面的内存悄悄写坏
+ *   （在 FreeRTOS 里那往往是堆里紧挨着的另一个对象），然后在完全不相干的地方
+ *   以断言/异常的形式暴露出来。2026-09-20 就被坑过一次：位置跟随把无线命令这条
+ *   调用链压深了 ~550 字节，otaSvc 的 2 KB 栈溢出，报出来的却是 queue.c 里的
+ *   `pxQueue->uxItemSize == 0`。有个能直接问"还剩多少"的口子，下次就是一眼的事。
+ *
+ * ⚠ s_status 故意做成 static：一次 CTRL 命令只会有一个任务在跑（otaSvc），
+ *   而 TaskStatus_t × 12 有 400 多字节 —— 放栈上正好又是这条链上的一笔开销。
+ */
+static void OtaService_DumpStacks(void)
+{
+    static TaskStatus_t s_status[OTA_STACK_DUMP_MAX];
+    char                line[128];
+    UBaseType_t         n = uxTaskGetSystemState(s_status, OTA_STACK_DUMP_MAX, NULL);
+
+    if (n == 0U)
+    {
+        UartLog_Print("[stack] uxTaskGetSystemState failed\r\n");
+        return;
+    }
+
+    (void)snprintf(line, sizeof(line),
+                   "[stack] %u tasks, free stack in bytes (bigger = safer):\r\n",
+                   (unsigned)n);
+    UartLog_Print(line);
+
+    /* 一行排两个，省点日志行数（任务名最长 configMAX_TASK_NAME_LEN） */
+    for (UBaseType_t i = 0U; i < n; i += 2U)
+    {
+        char tail[48];
+
+        tail[0] = '\0';
+
+        if ((i + 1U) < n)
+        {
+            (void)snprintf(tail, sizeof(tail), "  %s=%u", s_status[i + 1U].pcTaskName,
+                           (unsigned)(s_status[i + 1U].usStackHighWaterMark *
+                                      sizeof(StackType_t)));
+        }
+
+        (void)snprintf(line, sizeof(line), "[stack]   %s=%u%s\r\n",
+                       s_status[i].pcTaskName,
+                       (unsigned)(s_status[i].usStackHighWaterMark * sizeof(StackType_t)),
+                       tail);
+        UartLog_Print(line);
+    }
+}
+
 static void OtaService_Ctrl(uint8_t seq, const uint8_t *pl, uint16_t len)
 {
     uint8_t  rsp[13];       /* status(1) + data(4) + data2(4) + data3(4)：见 ota_layout.h */
@@ -262,13 +329,23 @@ static void OtaService_Ctrl(uint8_t seq, const uint8_t *pl, uint16_t len)
         out    = PowerMon_GetCells();
         out2   = out;
     }
+    else if (pl[0] == OTA_CTRL_STACKS)
+    {
+        /* 只读诊断：明细全在日志里（串口助手/monitor 直接能看），回帧只报 OK。
+           不是电机命令，所以在进 MotorCtrl_RemoteCmd 之前处理掉。 */
+        OtaService_DumpStacks();
+
+        rsp[0] = (uint8_t)OTA_OK;
+    }
     else
     {
         /* payload = cmd(1) arg(4) [motor(1)]：最后一个字节是**可选的**电机序号
            （1 起；不填或 0 = 没指定），老上位机只发 5 字节也能用 */
         uint8_t motor_index = (len >= 6U) ? pl[5] : 0U;
 
-        rsp[0] = MotorCtrl_RemoteCmd(motor_index, pl[0], Ota_GetLe32(&pl[1]), &out);
+        /* out/out2/out3 = 回帧里的 data/data2/data3（三个 32 位槽位，用不上就是 0） */
+        rsp[0] = MotorCtrl_RemoteCmd(motor_index, pl[0], Ota_GetLe32(&pl[1]),
+                                     &out, &out2, &out3);
     }
 
     Ota_PutLe32(&rsp[1], out);

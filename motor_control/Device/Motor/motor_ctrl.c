@@ -20,6 +20,7 @@
 
 #include "motor.h"
 #include "motor_fmt.h"
+#include "motor_follow.h"   /* 位置跟随（2 号机 → 1 号机）：跟随循环在它自己的任务里 */
 #include "motor_power.h"    /* 电机电源开关（PC14） */
 #include "uart_log.h"
 #include "ws2812.h"
@@ -58,6 +59,14 @@ extern osTimerId_t motorPosHandle;
    256 是算出来的：最长的状态行（含 position 的 0.1°、故障码文本和 10 字节 raw）
    最坏情况约 168 字节，留足余量；改短了 gcc 会报 -Wformat-truncation。 */
 #define MOTOR_LINE_SIZE             256U
+
+/* 短行缓冲：只给“肯定短”（< 140 字节）且**处在深调用链里**的日志用。
+   ⚠ 栈是按嵌套深度叠加的：MOTOR_LINE_SIZE 的行缓冲如果和另一个嵌套的函数
+     （比如 MotorCtrl_LogMode）同时活着，光这两个就要 700 字节栈。
+     实测踩过：跟随功能把无线命令那条链压深了 ~550 字节，otaSvc 任务的
+     2 KB 栈被压爆，而症状是 FreeRTOS 里一个毫不相干的断言（栈溢出把堆里
+     挨着的队列控制块写坏了），查了很久。能省就省。 */
+#define MOTOR_LINE_SHORT            144U
 
 /* 10 字节 raw 打成文本的最长长度：2*10 + 9 个空格 + '\0' */
 #define MOTOR_HEX_SIZE              32U
@@ -109,9 +118,6 @@ extern osTimerId_t motorPosHandle;
 
 /* ---- 位置环自检 / 防跑飞 ---- */
 
-/* 模式查询（0x75）没答上时的返回值：0xFF 不可能是合法模式值 */
-#define MOTOR_MODE_UNKNOWN          0xFFU
-
 /* 位置环下走一步（最多 270°）里程最多变 ±1 圈。
    里程变化超过这个值 = 给定的 "位置" 其实被当成了电流/转速，电机在连轴转 ——
    实测踩过这个坑：目标 90°，电机 1 秒连转 3 圈不停（每 200ms 查一次，
@@ -142,8 +148,9 @@ extern osTimerId_t motorPosHandle;
    顺序就是无线命令里的电机序号：1 = motor_ids[0]（总线 ID1）、2 = motor_ids[1]（ID2） */
 static const uint8_t motor_ids[MOTOR_COUNT] = { 1U, 2U };
 
-/* 无线命令里的"电机序号"（1 起）→ 总线 ID。序号越界返回 0（= 没有这台） */
-static uint8_t MotorCtrl_MotorIdOfIndex(uint8_t index)
+/* 无线命令里的"电机序号"（1 起）→ 总线 ID。序号越界返回 0（= 没有这台）。
+   跟随模块（motor_follow.c）也用它把“2 号机”换成帧首字节，所以是公开的。 */
+uint8_t MotorCtrl_MotorIdOfIndex(uint8_t index)
 {
     if ((index >= 1U) && (index <= MOTOR_COUNT))
     {
@@ -171,6 +178,11 @@ static WS2812_Color_t s_led_color = WS2812_COLOR_RED;
 /* 1 = 无线 OTA 升级中：电机强制失能、停轮询、禁止再命令走动。
    由 OtaService 在会话开始/结束时置位/清除（见 MotorCtrl_SetOtaMode） */
 static uint8_t s_ota_mode = 0U;
+
+/* 200 ms 轮询被暂停的次数（不是布尔值）：OTA 会话和位置跟随各会停一次，
+   计数归零才真的把定时器开回来 —— 用布尔值的话，先恢复的那一个
+   会把另一个还需要的“暂停”也一并解开，于是轮询和跟随一起抢总线 */
+static uint8_t s_poll_pause_cnt = 0U;
 
 /* Private function prototypes -----------------------------------------------*/
 static void           MotorCtrl_PollTask(void *argument);
@@ -678,17 +690,27 @@ static void MotorCtrl_LogVersion(uint8_t motor_id)
  */
 static uint8_t MotorCtrl_EnterPositionLoop(uint8_t motor_id, MotorMode *ack)
 {
-    char line[MOTOR_LINE_SIZE];
-    char hex[MOTOR_HEX_SIZE];
+    char    line[MOTOR_LINE_SIZE];
+    char    hex[MOTOR_HEX_SIZE];
+    uint8_t mode_before;
 
     if (ack == NULL)
     {
         return 0U;
     }
 
-    /* 切之前先看一眼当前模式（使能之后默认是 0x01 电流环），方便对比 */
-    UartLog_Print("mode before switch (expect 0x01 current loop):\r\n");
-    (void)MotorCtrl_LogMode(motor_id);
+    /* 切之前先看一眼当前模式（使能之后默认是 0x01 电流环），方便对比。
+       ⚠ 这里**刻意不用 MotorCtrl_LogMode()**：它自带 256 字节行缓冲，和本函数
+         的行缓冲嵌套着同时活着 —— 光这一对就要 700 字节栈，而本函数很可能是
+         从无线命令（otaSvc 任务）这条路进来的（实测就把那个任务的栈压爆过，
+         见 MOTOR_LINE_SHORT 的注释）。就地查一次模式值、用一行短的打出来。 */
+    mode_before = MotorCtrl_QueryModeValue(motor_id);
+
+    (void)snprintf(line, sizeof(line),
+                   "id=%u mode before switch (expect 0x01 current loop): 0x%02X (%s)\r\n",
+                   (unsigned int)motor_id, (unsigned int)mode_before,
+                   Motor_ModeName(mode_before));
+    UartLog_Print(line);
 
     uint8_t ok = Motor_SetMode(motor_id, MOTOR_MODE_POSITION, ack);
 
@@ -931,14 +953,19 @@ void MotorCtrl_SetOtaMode(uint8_t on)
     {
         s_ota_mode = 1U;
 
-        MotorCtrl_DisableAll();                       /* 先失能：升级期间电机必须不使劲 */
-        (void)osTimerStop(motorPosHandle);            /* 停轮询，别和 OTA 抢带宽 */
+        MotorCtrl_PollPause(1U);                      /* 先停轮询，别和 OTA 抢带宽 */
+
+        /* 再停跟随：它自己会去改电机状态、而且占着总线。
+           （它内部的 PollPause(0) 把上面那次暂停退回去，计数仍是 1 = 暂停。） */
+        (void)MotorFollow_Stop();
+
+        MotorCtrl_DisableAll();                       /* 最后失能：升级期间电机必须不使劲 */
     }
     else if ((on == 0U) && (s_ota_mode != 0U))
     {
         s_ota_mode = 0U;
 
-        (void)osTimerStart(motorPosHandle, pdMS_TO_TICKS(MOTOR_CTRL_POLL_MS));
+        MotorCtrl_PollPause(0U);
     }
 }
 
@@ -951,7 +978,8 @@ uint8_t MotorCtrl_OtaMode(void)
  * 无线控制命令：上位机发 OTA_T_CTRL，payload[0] = cmd、payload[1..4] = arg。
  * 返回 OTA_OK 或 OTA_E_xxx（见 ota_layout.h），*out 是给上位机看的附加信息。
  */
-uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg, uint32_t *out)
+uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg,
+                            uint32_t *out, uint32_t *out2, uint32_t *out3)
 {
     MotorMode ack;
     uint8_t   ok = 1U;
@@ -970,14 +998,36 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg, uint
         *out = 0U;
     }
 
+    if (out2 != NULL)
+    {
+        *out2 = 0U;
+    }
+
+    if (out3 != NULL)
+    {
+        *out3 = 0U;
+    }
+
     /* 升级期间只允许"失能 / 急停 / 静音 / 停轮询 / 断电"，别的都拒绝 ——
        正在擦写 Flash 的时候让电机转起来是找死；
-       电源也只准"关"（OTA_BEGIN 自己会先断电），不许在升级期间把电机重新上电。 */
+       电源也只准"关"（OTA_BEGIN 自己会先断电），不许在升级期间把电机重新上电。
+       （位置跟随的两个命令不在名单里 ⇒ 升级中发过来会被下面这段挡掉） */
     if ((s_ota_mode != 0U) && (cmd != OTA_CTRL_DISABLE) && (cmd != OTA_CTRL_STOP) &&
         (cmd != OTA_CTRL_LOG_MUTE) && (cmd != OTA_CTRL_POLL_PAUSE) &&
         !((cmd == OTA_CTRL_PWR) && (arg == 0U)))
     {
         return OTA_E_NOTALLOWED;
+    }
+
+    /* 跟随在跑的时候：作用于 **follower（1 号机）或“全部”** 的手动命令要先停跟随，
+       否则跟随循环下一拍就把电机拽回目标位置，急停 / 失能会“按不住”；
+       而**指名 leader（2 号机）** 的命令不停跟随 —— 那正是“自己驱动遥控端”那条路子。 */
+    if ((MotorFollow_IsRunning() != 0U) &&
+        (cmd != OTA_CTRL_FOLLOW) && (cmd != OTA_CTRL_SPIN) &&
+        ((motor_index == 0U) || (motor_index == MOTOR_FOLLOW_FOLLOWER_INDEX)))
+    {
+        UartLog_Print("motor: follow stopped by a manual command\r\n");
+        (void)MotorFollow_Stop();
     }
 
     switch (cmd)
@@ -1057,13 +1107,49 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg, uint
             break;
 
         case OTA_CTRL_POLL_PAUSE:
-            if (arg != 0U)
+            /* 用可嵌套的暂停接口（别直接 osTimerStop）：跟随/OTA 也在用同一个定时器 */
+            MotorCtrl_PollPause((arg != 0U) ? 1U : 0U);
+            break;
+
+        case OTA_CTRL_FOLLOW:
+            /* 位置跟随（2 号机当遥控端 → 1 号机跟着转）：arg = 0 停 / 其它 = 周期 ms
+               回复：data = 1 在跑、data2 = 实测周期 µs、data3 = 平均跟随误差（计数） */
+            if (arg == 0U)
             {
-                (void)osTimerStop(motorPosHandle);
+                (void)MotorFollow_Stop();
             }
-            else
+            else if (MotorFollow_Start(arg) == 0U)
             {
-                (void)osTimerStart(motorPosHandle, pdMS_TO_TICKS(MOTOR_CTRL_POLL_MS));
+                ok = 0U;
+            }
+
+            {
+                MotorFollowStats fs;
+
+                MotorFollow_GetStats(&fs);
+
+                if (out  != NULL) { *out  = MotorFollow_IsRunning(); }
+                if (out2 != NULL) { *out2 = fs.period_us_meas; }
+                if (out3 != NULL) { *out3 = (uint32_t)fs.err_avg_counts; }
+            }
+            break;
+
+        case OTA_CTRL_SPIN:
+            /* leader 自动匀速转：arg = 转速（0.1°/s，0 = 停）。
+               回复：data = 生效转速、data2 = leader 的总线 ID */
+            if (MotorFollow_SetSpin(arg) == 0U)
+            {
+                ok = 0U;
+            }
+
+            if (out != NULL)
+            {
+                *out = MotorFollow_GetSpin();
+            }
+
+            if (out2 != NULL)
+            {
+                *out2 = MotorCtrl_MotorIdOfIndex(MOTOR_FOLLOW_LEADER_INDEX);
             }
             break;
 
@@ -1141,6 +1227,104 @@ uint8_t MotorCtrl_RemoteStatus(uint8_t motor_index, int32_t *mileage, uint16_t *
     return OTA_OK;
 }
 
+/* ---- 给跟随模块（motor_follow.c）用的内部工具 -----------------------------
+ * 这些活（使能 / 切位置环 / 急停 / 停轮询）在本文件里都已经实现过一遍了，
+ * 直接复用，免得跟随模块再写一套、以后两边各自漂移。 */
+
+/*
+ * 查一次模式值（0x75 -> 0x76），**不打日志**：
+ * 跟随循环里"要不要重新配位置环"这种判断不能每次都往日志里灌。
+ * 查不到（超时/不答）返回 MOTOR_MODE_UNKNOWN。
+ */
+uint8_t MotorCtrl_QueryModeValue(uint8_t motor_id)
+{
+    MotorMode mode;
+
+    return (Motor_QueryMode(motor_id, &mode) != 0U) ? mode.mode : (uint8_t)MOTOR_MODE_UNKNOWN;
+}
+
+/*
+ * 把一台电机弄进位置环：使能（自带重试，最多约 5 s）→ 0xA0/0x03 → 0x75 复核。
+ * 返回 1 = 确认已在位置环（0x03）；0 = 没成功（原因在日志里）。
+ *
+ * ⚠ 只看 0xA1"有没有回帧"是不够的：不认 0x03 的固件也会回一个合法的 0xA1，
+ *   那时电机其实还在电流/速度环里，我们再按"位置"发 0x64 就会被当成电流给定
+ *   （实测踩过：目标 90°，电机 1 秒连转 3 圈）。
+ */
+uint8_t MotorCtrl_PreparePositionLoop(uint8_t motor_id)
+{
+    MotorMode ack;
+    uint8_t   mode_after;
+
+    if (MotorCtrl_Enable(motor_id, &ack) == 0U)
+    {
+        UartLog_Print("motor: enable FAILED (no valid 0xA1) - check power/wiring\r\n");
+        return 0U;
+    }
+
+    if (MotorCtrl_EnterPositionLoop(motor_id, &ack) == 0U)
+    {
+        return 0U;      /* 日志已经在那边打过了 */
+    }
+
+    mode_after = MotorCtrl_LogMode(motor_id);       /* 0x75 -> 0x76 复核模式值 */
+
+    if (mode_after != MOTOR_MODE_POSITION)
+    {
+        char line[MOTOR_LINE_SHORT];
+
+        (void)snprintf(line, sizeof(line),
+                       "id=%u position loop NOT active (mode=0x%02X, %s) - refusing\r\n",
+                       (unsigned int)motor_id, (unsigned int)mode_after,
+                       Motor_ModeName(mode_after));
+        UartLog_Print(line);
+        return 0U;
+    }
+
+    UartLog_Print("position loop confirmed (0x03)\r\n");
+
+    return 1U;
+}
+
+/* 急停两台（0x64 给定值 0）→ 失能两台 → 切 PC14 电源。给"出事就停"用 */
+void MotorCtrl_SafeStopAll(void)
+{
+    for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
+    {
+        MotorCtrl_Stop(motor_ids[i]);
+    }
+
+    MotorCtrl_DisableAll();
+}
+
+/*
+ * 暂停 / 恢复 200 ms 状态轮询。**用计数而不是布尔**：
+ * OTA 会话和位置跟随都要把它停掉，两边都恢复了才该重新开始 ——
+ * 布尔值的话，先恢复的那一个会把另一个还需要的"暂停"一并解开，
+ * 于是轮询和跟随又一起抢那条总线。
+ */
+void MotorCtrl_PollPause(uint8_t on)
+{
+    if (on != 0U)
+    {
+        if (s_poll_pause_cnt < 0xFFU)
+        {
+            s_poll_pause_cnt++;
+        }
+
+        (void)osTimerStop(motorPosHandle);
+    }
+    else if (s_poll_pause_cnt > 0U)
+    {
+        s_poll_pause_cnt--;
+
+        if (s_poll_pause_cnt == 0U)
+        {
+            (void)osTimerStart(motorPosHandle, pdMS_TO_TICKS(MOTOR_CTRL_POLL_MS));
+        }
+    }
+}
+
 void MotorCtrl_Task(void *argument)
 {
     char line[MOTOR_LINE_SIZE];
@@ -1158,6 +1342,15 @@ void MotorCtrl_Task(void *argument)
     for (;;)
     {
         MotorCtrl_WaitKeyPress();
+
+        /* 跟随正在跑的时候，按键流程会和跟随循环抢总线（而且它会切电源、改模式、
+           还会让电机自己走一圈）—— 直接忽略这一次按键，让用户先发
+           `ctrl follow 0` 把跟随停掉。灯也不换，免得看起来像"按键生效了"。 */
+        if (MotorFollow_IsRunning() != 0U)
+        {
+            UartLog_Print("key ignored: position follow is running (ctrl follow 0 to stop)\r\n");
+            continue;
+        }
 
         WS2812_SetColor(MotorCtrl_LedNextColor());   /* 按键已按下：换下一个颜色 */
 

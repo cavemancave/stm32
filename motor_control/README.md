@@ -442,6 +442,70 @@ ID 是**上电时由电机的 ID 脚锁存**的（低 = ID1、高 = ID2），所
     `WS2812_DEFAULT_BRIGHTNESS = 32`，颜色权重为 0 时输出全 0（灭）。
     读回用 `WS2812_GetBrightness()` / `WS2812_GetColorRGB()`（比例）/ `WS2812_GetOutput()`（实际 PWM 值）。
 
+### 位置跟随（2 号机遥控 → 1 号机跟随，2026-09-20 加）
+
+**2 号机 = 遥控端，1 号机 = 被控端**：每一拍读一次 2 号机的实测位置，把它当成 1 号机的
+位置环目标发过去（闭环在**设备里**，上位机只负责开关 —— 走上位机中继光链路延迟就跟不上）。
+
+完整设计/取舍见 `docs/ota_design.md` §5.4.3 和 `Device/Motor/motor_follow.c` 的文件头注释。
+这里只说怎么用：
+
+```bash
+python tools/ota.py --port COM7 ctrl follow        # ① 开始跟随（默认 20 ms 周期；会先上电+切位置环）
+python tools/ota.py --port COM7 ctrl spin 900      # ② 让 2 号机以 90.0°/s 自动转（0.1°/s 为单位，0=停）
+python tools/ota.py --port COM7 ctrl follow 0      # ③ 停止（回帧里带实测周期和平均跟随误差）
+```
+
+- 实时数据看设备日志的 `[follow]` 行（每秒两行，不用另开终端也够用）：
+
+  ```
+  [follow] t=12s rate=48.5Hz travel=3.25rev miss=0/0 glitch=0 overrun=0 hwm=1860
+  [follow]   lag avg=-1.2 max=+2.4 deg (leader id2 -> follower id1)
+  ```
+
+  `rate` = 实测跟随频率（一拍 3~4 条帧、同一总线一问一答，所以 50~150 Hz 就是上限）；
+  `lag avg/max` = 1 号机落后 2 号机多少度（**这就是"跟得紧不紧"的答案**）；
+  `hwm` = 跟随任务还剩多少字节栈（见下面那段"栈溢出"的教训）。
+- **不想让它自动转**（真遥操作）：别发 `spin`，把 2 号机**失能**（`ctrl disable --motor 2`），
+  用手拖它，1 号机就会跟 —— 跟随循环只读位置，失能状态照样能读（`0x74` 照常答）。
+- **自己用上位机驱动 2 号机**也行（`ctrl movepos ... --motor 2`）：指名 2 号机的命令
+  **不会**打断跟随；而"不指定 / 指定 1 号机"的命令（使得是急停、失能）会**先把跟随停掉**
+  —— 否则跟随循环下一拍就把电机拽回目标位置，急停会"按不住"。
+- 安全阀：2 号机一拍跳 > 90° ⇒ 当假数据丢掉；跟随误差 > 一整圈 ⇒ 判失控（急停+失能+断电）；
+  连续 5 拍读不到电机 ⇒ 中止；**跟随期间按 USER_KEY 会被忽略**（会和跟随循环抢总线）。
+- ⚠ 跟随期间 200 ms 状态轮询会暂停（`MotorCtrl_PollPause`，计数式，可嵌套），所以
+  `status` 还能问、但日志里不再有周期性的 `0x74` 行。
+
+#### ⚠⚠ 加功能把无线命令任务的栈压爆过（2026-09-20，查了大半天）
+
+跟随功能加完、一执行 `ctrl follow` 就报：
+
+```
+*** ASSERT FAILED ***
+  pxQueue->uxItemSize == 0
+  at .../FreeRTOS/Source/queue.c:1586
+```
+
+**症状和原因完全不在一处**：这是 `xQueueSemaphoreTake` 里的断言，意思是"你拿一个
+**非旗标**（item size ≠ 0）当旗标 take 了"，实际上真正的错是 **otaSvc 任务的 2 KB 栈溢出**。
+栈往**低地址**长，溢出去正好把堆里紧挨着它的 **UartLog 互斥量控制块**写坏了，
+下一次 `UartLog_Lock()` 就撞在这个莫名其妙的断言上。
+
+原因是无线命令这条调用链很深，而新加的 `MotorFollow_Start → PreparePositionLoop
+→ EnterPositionLoop → 日志格式化` 又叠了 ~550 字节：
+
+- 编译带了 `-fstack-usage`，`.su` 文件里有每个函数的**实测**帧大小，加起来算一下就知道：
+  `OtaService_Task(160)+OnFrame(32)+Ctrl(64)+RemoteCmd(96)+Start(248)+Prepare(304)
+  +EnterPositionLoop(352)+LogMode(352)+Motor_*(~230) ≈ 1.8 KB`（还没算 newlib 的 snprintf
+  和中断栈帧）⇒ 2 KB 真的不够。
+- 改法：**①** `MotorCtrl_EnterPositionLoop` 里那个嵌套的 `MotorCtrl_LogMode()` 换成
+  `MotorCtrl_QueryModeValue()` + 一行短日志（省整整 352 字节栈：两个 256 字节行缓冲不再同时活着）；
+  **②** 深链上的短日志用 `MOTOR_LINE_SHORT`(144) 而不是 `MOTOR_LINE_SIZE`(256)；
+  **③** `OTA_SVC_TASK_STACK` 2 KB → 3 KB。
+- 教训：**栈溢出不出声**。症状会跑到毫不相干的地方（这里甚至是 FreeRTOS 内部）。
+  所以顺手加了 `ctrl stacks`：直接问"每个任务还剩多少字节栈"（`hwm` 越大越安全），
+  跟随日志里每行也带一个 `hwm`。以后加功能/加深调用链，先看这两个数。
+
 ### ⚠️ SPI6 的 SCK 占用了 PA5（按键 / ADC1_CH18）
 
 - SPI 主机（哪怕是“只发不收”）**必须输出 SCK**，所以 CubeMX 把 `PA5 → SPI6_SCK` 也配上了，

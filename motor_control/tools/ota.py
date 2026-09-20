@@ -88,6 +88,9 @@ CTRL = {
     "pwr": 0x08,          # 电机电源（PC14）：--arg 0=断电 1=上电 2=断电重启
     "vmon": 0x09,         # 读电源电压（PC4/ADC1_INP4 分压取样）：data = 总压 mV
     "cells": 0x0A,        # 设置电池串数（1..8，算“单片电压”用）
+    "follow": 0x0B,       # 位置跟随（2 号机→1 号机）：--arg 0=停，其它=周期 ms（默认 20）
+    "spin": 0x0C,         # 让 2 号机自动匀速转：--arg 转速，单位 0.1°/s（0=停）
+    "stacks": 0x0D,       # 打印每个任务的栈余量（明细在设备日志里，会自动回显）
 }
 
 # 带固定参数的快捷命令：名字 → (cmd, arg)。想手动指定就再加 --arg。
@@ -633,8 +636,10 @@ def cmd_ctrl(dev: Device, args):
             arg = args.arg              # 允许手动覆盖（比如 pwr --arg 2）
     else:
         cmd = CTRL[args.cmd]
+        # 默认参数：mute/pause 默认"开"(1)；follow 不填 = 启动且用默认周期(20 ms)；其它 = 0
         arg = args.arg if args.arg is not None else (
-            1 if args.cmd in ("mute", "pause") else 0)
+            1 if args.cmd in ("mute", "pause") else
+            20 if args.cmd == "follow" else 0)
 
     # 第 6 个字节 = 电机序号（1 起；不填 = 设备按“安全类命令管全部、运动类默认 1 号机”处理）。
     # 老固件只发 5 字节也照样能用，所以这是向后兼容的追加。
@@ -659,6 +664,18 @@ def cmd_ctrl(dev: Device, args):
     elif cmd == 0x0A:                   # 串数命令：data2 = 生效后的串数
         cells = data2 or data
         extra = (f"  已按 {cells}S 算（单片窗口 {cells * 3.30:.2f}~{cells * 4.25:.2f}V）")
+    elif cmd == 0x0B:                   # 跟随命令：data = 1 在跑，data2 = 实测周期 µs，data3 = 平均误差
+        extra = f"  跟随={'运行中' if data else '已停止'}"
+        if data and data2:
+            extra += f"  实测周期={data2 / 1000.0:.2f}ms（{1000000.0 / data2:.1f}Hz）"
+        if data and data3:
+            extra += f"  平均落后={i32(rsp, 9) * 360.0 / 32768:+.1f}°"
+        extra += "  （实时数字看设备日志的 [follow] 行）"
+    elif cmd == 0x0C:                   # spin：data = 生效转速（0.1°/s），data2 = leader 总线 ID
+        extra = (f"  2 号机（ID{data2}）转速={data / 10.0:.1f}°/s" if data
+                 else "  2 号机已停（就地保持）")
+    elif cmd == 0x0D:                   # 栈余量：明细行已经随文本口回显在上面了
+        extra = "  逐任务栈余量见上面 [stack] 行"
     print(f"{args.cmd}({arg}){who} → {ST_TEXT.get(rsp[0], rsp[0])}  data={data}{extra}")
 
 
@@ -779,10 +796,11 @@ def main():
     p = sub.add_parser("ctrl", help="控制电机 / 读电源电压（不用 OTA 时这个口就是干这个的）")
     p.add_argument("cmd", choices=sorted(CTRL.keys()) + sorted(CTRL_ARG.keys()),
                    help="disable/enable/posloop/movepos/movedeg/stop/mute/pause/pwr/vmon/cells"
-                        "/pwron/pwoff/pwcycle/6s/3s/12v")
+                        "/follow/spin/stacks/pwron/pwoff/pwcycle/6s/3s/12v")
     p.add_argument("arg", nargs="?", type=lambda s: int(s, 0), default=None,
                    help="参数：movepos=0..32767、movedeg=0..359、mute/pause=0/1、pwr=0/1/2、"
-                        "cells=1..8（vmon 不用）")
+                        "cells=1..8（vmon/stacks 不用）；follow=0 停 / 周期 ms（默认 20）；"
+                        "spin=转速（0.1°/s，0=停）")
     p.add_argument("--motor", type=int, default=0,
                    help=f"作用于哪一台（1..{N_MOTORS}）；不填 = 设备默认"
                         f"（失能/急停管全部，使能/走位管 1 号机）")
