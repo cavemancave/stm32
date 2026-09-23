@@ -1,0 +1,17 @@
+build
+mx.scratch
+!.settings
+
+# 厂商 PDF 手册（如 docs/M0603A_111_motor_specification_cn.pdf）：
+# 不入本库，后续用单独的仓库跟踪
+docs/*.pdf
+
+# 厂商上位机工程 / 指令集文件：
+#   docs/M0603A 系列直驱电机.bit   —— 上位机工程（二进制）
+#   docs/M63A快捷指令集.cfg        —— 快捷指令集（0x03 位置环的依据）
+# 同样不入本库，结论已摘录到 docs/specification.md 与 README
+docs/*.bit
+docs/*.cfg
+
+# 上位机脚本（tools/）被 import 时会生成的 Python 缓存
+tools/__pycache__/
