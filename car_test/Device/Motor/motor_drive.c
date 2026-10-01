@@ -11,8 +11,9 @@
   *   4) 看门狗：超时就把两台停掉（松手/断线/上位机挂了都靠它兜底）。
   *
   * ⚠ 位置只用"最短路径增量"累加，不要用 0x74 的里程字段（它过零点时会掉一整圈，
-  *   详见 motor_follow.c 里 MotorFollow_ShortestDiff 的注释）。
-  * ⚠ 不在这里点 LED：WS2812 走 SPI6，只允许一个任务驱动（现有约定是 MotorCtrl_Task 独占）。
+  *   见本文件 MotorDrive_ShortestDiff 的注释）。
+  * ⚠ 不在驱动循环里点 LED：WS2812 走 SPI6（SPI 波形模拟单总线），
+  *   多个任务并发点灯会把帧打断。
   ******************************************************************************
   */
 
@@ -38,10 +39,10 @@
 #define DRIVE_LINE_SIZE           160U
 
 /* 任务栈（字节，CMSIS-RTOS2 的 stack_size 单位是字节）：
-   里面有 snprintf（日志行）+ HAL 调用，和跟随/轮询任务一样留 2 KB */
+   里面有 snprintf（日志行）+ HAL 调用，留 2 KB */
 #define DRIVE_TASK_STACK          (512U * 4U)
 
-/* 状态行周期（1 Hz，和跟随一样，不用另开终端也够看） */
+/* 状态行周期（1 Hz，不用另开终端也够看） */
 #define DRIVE_REPORT_MS           1000U
 
 /* Private variables ---------------------------------------------------------*/
@@ -64,7 +65,7 @@ static volatile uint8_t s_run  = 0U;
 static volatile uint8_t s_busy = 0U;
 
 /* 1 = 200 ms 轮询是我们停的（只能由我们恢复）：
-   PollPause 是个共享计数器，别的模块（OTA/跟随）也在用，
+   PollPause 是个共享计数器，别的模块（OTA）也在用，
    自己不记着的话，一次"替别人恢复"就会把轮询提前开回来抢总线 */
 static uint8_t s_poll_paused = 0U;
 

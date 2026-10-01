@@ -188,13 +188,19 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-  /* 主控制流程：使能 → 切位置环 → 0 点 / 3 点来回（不返回） */
-  MotorCtrl_Task(argument);
+  (void)argument;
 
-  /* Infinite loop */
+  /* 启动诊断：能打到这里说明调度器起来了、defaultTask 在跑。 */
+  OtaTrace_Text("[app] J: defaultTask running\r\n");
+
+  UartLog_Print("motor control (FreeRTOS): USART10 38400 (2 motors), wireless USART1 921600\r\n");
+  UartLog_Print("no key/bench flow: drive the car over the wireless link (tools/car.py)\r\n");
+
+  /* 业务全部由无线命令驱动（小车：tools/car.py / tools/car_teleop.py）。
+     这个任务留作空闲 / 以后放低频维护逻辑。 */
   for(;;)
   {
-    osDelay(1);
+    osDelay(1000);
   }
   /* USER CODE END StartDefaultTask */
 }

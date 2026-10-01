@@ -1,41 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""两轮差速小车的命令行测试框架（跑在 `tools/ota.py` 的协议层之上）。
+"""两轮差速小车上位机：左右轮识别 / 差速走 / 看门狗 / 键盘遥控，一个脚本全包。
 
-它只干一件事：**让你一条命令就让某一台电机按某个转速转**，先把台架摸清楚，
-再谈小车控制。轮子用**速度环**（0x02）——为什么不是位置环/电流环，见
-`README.md` 的「两轮差速小车（速度环）」一节和 `Device/Motor/inc/motor_ctrl.h` 里的说明。
+轮子用**速度环**（0x02）——为什么不是位置环，见 docs/car.md。
+协议层在 `tools/proto.py`；**固件升级**用 `tools/ota.py`；**单台电机**用 `tools/motor.py`。
 
-串口默认 /dev/ttyACM0（Linux 的 USB-CDC）；CH340/CP210x 那类一般是 /dev/ttyUSB0，
-用 `--port` 指定或设环境变量 CAR_PORT。
+串口**不用指定**：系统上只有一个 USB 串口时脚本会自己用它（Windows 的 COM* 和 Linux
+的 /dev/ttyACM*、/dev/ttyUSB* 都认）。要换就 `--port COM7`（写在子命令后面也行，
+如 `car.py status --port COM7`），或者设环境变量 CAR_PORT。
 
 典型用法（每一步都单独跑，串口一次只开一个程序）：
 
-    python tools/car.py setup                 # ① 上电 + 两台都使能 + 切速度环
-    python tools/car.py status                #    看两台的模式/位置/里程/故障码
+    python tools/car.py setup                 # ① 上电 + 两台使能 + 切速度环 + 配闭环
+    python tools/car.py status                #    看两台的模式/位置/里程/故障码/电源
     python tools/car.py id                    # ② 识别左右轮（依次点动两台，问你是哪边动）
     python tools/car.py spin --motor 1 --rpm 20 --seconds 2    # ③ 单轮点动
     python tools/car.py drive --left 20 --right 20 --seconds 3  # ④ 两轮一起（按 id 存的映射）
-    python tools/car.py stop                  # ⑤ 停车（--disable 连使能/电源一起切）
-    python tools/car.py watch --seconds 5     #    看两台实际转速（由编码器算出来的）
+    python tools/car.py teleop --speed 30     # ⑤ 键盘遥控：按住就走、松手就停
+    python tools/car.py stop --disable        # ⑥ 收工：停车 + 失能（断电另发 motor.py pwoff）
 
 ⚠ 安全：速度环下电机**一旦给了转速就会一直转**（不像位置环走到位自己停）。
    所以每个动作都是"给转速 → 等一会 → 一定给 0 停下"（Ctrl+C 也会在 finally 里停），
-   但**手别离开电源开关**，第一次测试先把轮子架空。跑远之前想加"断联停"再说
-   （需要固件周期性重发转速 + 电机开 0x10 断联功能）。
+   但**手别离开电源开关**，第一次测试先把轮子架空。
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import select
 import struct
 import sys
 import time
 
+try:                                # teleop 才需要；Windows 上没有这两个模块
+    import termios
+    import tty
+except ImportError:                 # pragma: no cover
+    termios = tty = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import ota      # noqa: E402  （复用 ota.py 里的 Device / COBS / CRC / 端序那几个小工具）
+
+import proto    # noqa: E402  （协议层：Device / COBS / CRC / 端序 / 帧类型）
 
 # ---- 协议里的 CTRL 子命令（要和 Device/Ota/inc/ota_layout.h 对齐）----------
 CTRL_DISABLE    = 0x00
@@ -53,7 +61,7 @@ MODE_NAMES = {0x00: "开环", 0x01: "电流环", 0x02: "速度环", 0x03: "位�
 # 速度环给定值的量纲：±3800 ↔ ±380rpm（1 单位 = 0.1rpm）
 RPM_MAX = 380.0
 
-# "哪台电机是左轮"这个小配置：id 命令会写它，drive 命令读它
+# "哪台电机是左轮"这个小配置：id 命令会写它，drive/teleop 读它
 MAP_PATH = os.path.join(HERE, "car_map.json")
 DEFAULT_MAP = {"left": 1, "right": 2, "invert_left": False, "invert_right": False}
 
@@ -64,32 +72,32 @@ DEFAULT_MAP = {"left": 1, "right": 2, "invert_left": False, "invert_right": Fals
 def ctrl(dev, cmd, arg=0, motor=0, timeout=8.0):
     """发一条 CTRL 命令，返回 (status, data, data2)。
 
-    motor = 0 表示"不指定"：设备侧对安全类命令（失能/急停）作用于全部电机，
-    对运动类命令默认作用于 1 号机 —— 两台车上的命令一定要显式给 --motor。
+    motor = 0 表示“不指定”：设备侧对安全类命令（失能/急停）作用于全部电机，
+    对运动类命令默认作用于 1 号机 —— 车上的命令一定要显式给电机号。
     """
     payload = struct.pack("<BI", cmd, arg & 0xFFFFFFFF) + (bytes([motor]) if motor else b"")
-    rsp = dev.request(ota.T_CTRL, payload, timeout=timeout, retries=2)
+    rsp = dev.request(proto.T_CTRL, payload, timeout=timeout, retries=2)
 
     if rsp is None:
-        raise ota.OtaError(f"ctrl cmd={cmd:#04x} 没有回复（设备在跑吗？串口对不对？）")
+        raise proto.OtaError(f"ctrl cmd={cmd:#04x} 没有回复（设备在跑吗？串口对不对？）")
 
-    data = ota.i32(rsp, 1)                      # 带符号：转速会是负数
-    data2 = ota.u32(rsp, 5) if len(rsp) > 8 else 0
+    data = proto.i32(rsp, 1)                        # 带符号：转速会是负数
+    data2 = proto.u32(rsp, 5) if len(rsp) > 8 else 0
     return rsp[0], data, data2
 
 
 def read_status(dev, motor):
-    """读一台电机的状态：里程 / 位置 / 故障码 / 当前模式。"""
-    rsp = dev.request(ota.T_STATUS, bytes([motor]), timeout=3.0, retries=3)
+    """读一台电机的状态：里程 / 位置 / 故障码 / 当前模式 / 电机电源。"""
+    rsp = dev.request(proto.T_STATUS, bytes([motor]), timeout=3.0, retries=3)
 
     if rsp is None:
-        raise ota.OtaError("STATUS 没有回复（设备在跑吗）")
-    if rsp[0] != ota.ST_OK:
+        raise proto.OtaError("STATUS 没有回复（设备在跑吗）")
+    if rsp[0] != proto.ST_OK:
         return None                 # 这台没答上（没上电 / 没接线 / ID 不是它）
 
-    pos = ota.u16(rsp, 5)
+    pos = proto.u16(rsp, 5)
     return {
-        "mileage": ota.i32(rsp, 1),
+        "mileage": proto.i32(rsp, 1),
         "pos": pos,
         "deg": pos * 360.0 / 32768.0,
         "fault": rsp[7],
@@ -109,14 +117,14 @@ def power_on(dev):
 def ensure_speed_loop(dev, motor, accel=None):
     """使能 + 切速度环。设备侧切完会自己用 0x75/0x76 复核模式值，我们再看回帧里的值。
 
-    ⚠ 超时给得宽（设备侧"上电等 500ms + 使能重试最多 5s"都在这条命令里），
-      但那只在"电机没上电/没接线"时才真的等满 —— 正常情况一发就回。
+    ⚠ 超时给得宽（设备侧“上电等 500ms + 使能重试最多 5s”都在这条命令里），
+      但那只在“电机没上电/没接线”时才真的等满 —— 正常情况一发就回。
     """
     st, mode, bus_id = ctrl(dev, CTRL_SPEED_LOOP, 0, motor, timeout=25.0)
 
-    if st != ota.ST_OK or mode != 0x02:
-        raise ota.OtaError(
-            f"电机{motor} 切速度环失败：status={ota.ST_TEXT.get(st, st)}、"
+    if st != proto.ST_OK or mode != 0x02:
+        raise proto.OtaError(
+            f"电机{motor} 切速度环失败：status={proto.ST_TEXT.get(st, st)}、"
             f"回帧模式={mode:#04x}（要 0x02）。\n"
             f"    先 `car.py status` 看它答不答得上；不答就是没上电/没接线/ID 不对。")
 
@@ -130,8 +138,8 @@ def set_accel(dev, motor, ms_per_rpm):
     """速度环加速时间：每 1rpm 多少 ms（0 按 1 处理）。越大起步越柔。"""
     st, data, _ = ctrl(dev, CTRL_ACCEL, int(ms_per_rpm), motor)
 
-    if st != ota.ST_OK:
-        raise ota.OtaError(f"电机{motor} 设加速时间失败（{ota.ST_TEXT.get(st, st)}）")
+    if st != proto.ST_OK:
+        raise proto.OtaError(f"电机{motor} 设加速时间失败（{proto.ST_TEXT.get(st, st)}）")
 
     return data
 
@@ -140,15 +148,15 @@ def set_speed(dev, motor, rpm):
     """给一台电机一个转速（rpm，带符号）。
 
     设备侧发 0x64 之前会自己确认它在速度环，不在就自动切过去 —— 因为同一个数值
-    在电流环里是电流、在位置环里是目标位置，"停车"给错环甚至会让轮子转回 0°。
+    在电流环里是电流、在位置环里是目标位置，“停车”给错环甚至会让轮子转回 0°。
     """
     if abs(rpm) > RPM_MAX:
-        raise ota.OtaError(f"转速 {rpm} rpm 超范围（±{RPM_MAX:.0f} rpm）")
+        raise proto.OtaError(f"转速 {rpm} rpm 超范围（±{RPM_MAX:.0f} rpm）")
 
     st, data, _ = ctrl(dev, CTRL_SPEED, int(round(rpm * 10)), motor, timeout=15.0)
 
-    if st != ota.ST_OK:
-        raise ota.OtaError(f"电机{motor} 给转速失败（{ota.ST_TEXT.get(st, st)}）")
+    if st != proto.ST_OK:
+        raise proto.OtaError(f"电机{motor} 给转速失败（{proto.ST_TEXT.get(st, st)}）")
 
     return data / 10.0
 
@@ -159,16 +167,16 @@ def stop_all(dev):
         try:
             set_speed(dev, motor, 0)
             print(f"  电机{motor}: 已停")
-        except ota.OtaError as e:
+        except proto.OtaError as e:
             print(f"  ⚠ 电机{motor} 停车失败：{e}")
 
 
 def set_speeds_together(dev, speeds, watchdog_ms=0, quiet=False):
     """{电机号: rpm} → **一条** DRIVE 命令（设备侧背靠背发两条 0x64）。
 
-    为什么不用两次 ctrl speed：那条路每台都要"无线往返一次 + 先查一次模式"，
+    为什么不用两次 ctrl speed：那条路每台都要“无线往返一次 + 先查一次模式”，
     而且两条 0x64 中间夹着上位机的循环 —— 实测两台起步能差 30~80ms，
-    低速时就是"先动的那侧把车拽歪一下"。合成一条之后只剩总线串行的 ~10ms。
+    低速时就是“先动的那侧把车拽歪一下”。合成一条之后只剩总线串行的 ~10ms。
 
     watchdog_ms > 0：设备自己兜底 —— 超过这么久没收到新的 DRIVE 就把两台停掉
     （松手/断线/上位机被强杀都会停，不用指望最后那条 stop 命令发得出去）。
@@ -178,43 +186,43 @@ def set_speeds_together(dev, speeds, watchdog_ms=0, quiet=False):
 
     for motor, rpm in speeds.items():
         if abs(rpm) > RPM_MAX:
-            raise ota.OtaError(f"电机{motor} 转速 {rpm} rpm 超范围（±{RPM_MAX:.0f} rpm）")
+            raise proto.OtaError(f"电机{motor} 转速 {rpm} rpm 超范围（±{RPM_MAX:.0f} rpm）")
         raw[int(motor)] = int(round(rpm * 10))
 
-    arg = ota.pair_pack(raw.get(1, 0), raw.get(2, 0))
+    arg = proto.pair_pack(raw.get(1, 0), raw.get(2, 0))
     wd_units = 0 if watchdog_ms <= 0 else max(1, min(255, int(watchdog_ms) // 50))
 
     st, data, data2 = ctrl(dev, CTRL_DRIVE, arg, wd_units, timeout=20.0)
 
-    if st == ota.ST_PARAM:
-        # 老固件没有这条命令：退回"一台一台发"（起步差回来，但至少能动）
+    if st == proto.ST_PARAM:
+        # 老固件没有这条命令：退回“一台一台发”（起步差回来，但至少能动）
         print("  ⚠ 固件不认 DRIVE（旧版本？）—— 退回一台一台发，起步会差一点")
         for motor, rpm in speeds.items():
             set_speed(dev, motor, rpm)
         return
 
-    if st != ota.ST_OK:
-        raise ota.OtaError(f"DRIVE 失败：{ota.ST_TEXT.get(st, st)}")
+    if st != proto.ST_OK:
+        raise proto.OtaError(f"DRIVE 失败：{proto.ST_TEXT.get(st, st)}")
 
     if not quiet:
-        v1, v2 = ota.pair_unpack(data)
+        v1, v2 = proto.pair_unpack(data)
         print(f"  一起走：电机1={v1 / 10.0:+.1f} 电机2={v2 / 10.0:+.1f} rpm"
               f"（看门狗 {data2}ms{'，不启用' if data2 == 0 else ''}）")
 
 
 def ensure_trim(dev, left_motor):
-    """告诉设备"哪台是左轮"：里程差闭环靠它才能知道往哪边补。
+    """告诉设备“哪台是左轮”：里程差闭环靠它才能知道往哪边补。
 
     很便宜（一条命令、不碰电机），所以 setup/drive/teleop 每次都先发一遍 ——
-    免得"换了车/改了 car_map.json，设备里还是老的左轮"这种静默错误（那种情况下车
+    免得“换了车/改了 car_map.json，设备里还是老的左轮”这种静默错误（那种情况下车
     会越走越歪，而且没人报错）。
-    （闭环只在"直行类"动作下积分，转圈/走弧设备自己会关，所以这里不用管动作。）
+    （闭环只在“直行类”动作下积分，转圈/走弧设备自己会关，所以这里不用管动作。）
     返回 True = 配上了。
     """
     st, on, left = ctrl(dev, CTRL_TRIM, int(left_motor), 0, timeout=6.0)
 
-    if (st != ota.ST_OK) or (on != 1) or (left != int(left_motor)):
-        print(f"  ⚠ 里程差闭环没配上（status={ota.ST_TEXT.get(st, st)}，状态={on}，左轮={left}）"
+    if (st != proto.ST_OK) or (on != 1) or (left != int(left_motor)):
+        print(f"  ⚠ 里程差闭环没配上（status={proto.ST_TEXT.get(st, st)}，状态={on}，左轮={left}）"
               f" —— 车还能走，但不会自己修直线")
         return False
 
@@ -265,12 +273,12 @@ def hold(dev, speeds, seconds):
                     for motor in started:
                         set_speed(dev, motor, 0)
                     print(f"  电机{list(started)[0]}: 已停")
-            except ota.OtaError as e:
+            except proto.OtaError as e:
                 print(f"  ⚠ 停车失败：{e}")
 
 
 # ---------------------------------------------------------------------------
-# 左右轮映射（id 命令写、drive 命令读）
+# 左右轮映射（id 命令写、drive/teleop 读）
 # ---------------------------------------------------------------------------
 def load_map():
     try:
@@ -292,7 +300,7 @@ def save_map(m):
 
 
 def wheel_speeds(rpm_left, rpm_right, m):
-    """(左轮 rpm, 右轮 rpm) → {电机号: rpm}，顺带处理左右定义和"反了"（invert）。
+    """(左轮 rpm, 右轮 rpm) → {电机号: rpm}，顺带处理左右定义和“反了”（invert）。
 
     差速底盘就两个自由度：
       直行   left = right（同号同值）
@@ -306,16 +314,171 @@ def wheel_speeds(rpm_left, rpm_right, m):
 
 
 # ---------------------------------------------------------------------------
+# 键盘遥控（teleop）：按住就走、松手就停
+# ---------------------------------------------------------------------------
+# kitty 键盘协议：`CSI > flags u`。flag 2 = 上报事件类型(按下/重复/抬起)，
+# flag 8 = 所有键都按转义序列上报（否则普通字母还是当文本发，拿不到“抬起”）。
+KITTY_ON = b"\x1b[>10u"
+KITTY_OFF = b"\x1b[<u"
+
+# 我们关心的键：字符 → kitty 的 keycode（小写字母的 ASCII 就是它的 keycode）
+KEYS = {"w": 119, "a": 97, "s": 115, "d": 100, " ": 32, "q": 113}
+CODE_TO_KEY = {v: k for k, v in KEYS.items()}
+
+
+class Keys:
+    """把终端变成“能拿到按下/抬起”的按键源。
+
+    进入/退出用 with，保证异常退出时终端属性也还原（否则终端会一直留在 raw 模式）。
+    """
+
+    def __init__(self, release_ms):
+        self.fd = sys.stdin.fileno()
+        self.release_s = max(0.05, release_ms / 1000.0)
+        self.down = {}          # 键 → 最近一次“看到它”的时刻
+        self.kitty = None       # None = 还没看出来；True = 收到过带事件类型的按键
+        self.buf = ""
+        self._saved = None
+
+    def __enter__(self):
+        if termios is None:
+            raise proto.OtaError("teleop 需要类 Unix 终端（termios/tty）—— Windows 请用 WSL，"
+                                 "或者改用 `car.py drive`/`spin` 逐条发命令")
+        self._saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)          # 不用回车；Ctrl+C 仍然是信号（ISIG 还开着）
+        # 请求带“抬起”事件的按键上报（不支持的终端会忽略这串，退回①）
+        os.write(sys.stdout.fileno(), KITTY_ON)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            os.write(sys.stdout.fileno(), KITTY_OFF)
+        except Exception:
+            pass
+        if self._saved is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
+
+    # -- 解析 ---------------------------------------------------------------
+    def _press(self, key):
+        if key in KEYS:
+            self.down[key] = time.monotonic()
+
+    def _kitty_key(self, body):
+        """kitty 协议的 `CSI code:alt ; mods:event ; text u` 里 body 的部分。
+
+        ⚠ 事件类型（1 按下 / 2 重复 / 3 抬起）是挂在**第二个字段的 `:` 后面**
+          （`97;1:3u` = a 抬起），不是第一个字段 —— 曾经按“第一个字段带 `:` 才是事件”
+          来解析，结果抬起被当成按下，**松手不停车**。
+          没带 modifiers 的简写形式（`97:3u`）也认：那种情况下 `:` 后面的 1/2/3 才是事件
+          （备用键码是个大得多的 unicode 码点，不会混）。
+        """
+        fields = body.split(";")
+        event = 1
+        code_text = fields[0].split(":")[0]
+
+        if len(fields) >= 2 and ":" in fields[1]:
+            try:
+                event = int(fields[1].split(":", 1)[1] or "1")
+            except ValueError:
+                event = 1
+        elif (len(fields) == 1) and (":" in fields[0]):
+            c, _, ev = fields[0].partition(":")
+            if ev in ("1", "2", "3"):
+                code_text, event = c, int(ev)
+
+        try:
+            key = CODE_TO_KEY.get(int(code_text))
+        except ValueError:
+            return
+
+        if key is None:
+            return
+
+        self.kitty = True
+
+        if event == 3:                  # 抬起：真事件，立刻删
+            self.down.pop(key, None)
+        else:
+            self._press(key)
+
+    def _feed(self, text):
+        i = 0
+
+        while i < len(text):
+            ch = text[i]
+
+            if ch == "\x1b" and i + 1 < len(text) and text[i + 1] == "[":
+                j = i + 2
+
+                while j < len(text) and not ("\x40" <= text[j] <= "\x7e"):
+                    j += 1
+
+                if j >= len(text):
+                    break               # 序列还没收完：剩下的下一拍再来
+
+                if text[j] == "u":
+                    self._kitty_key(text[i + 2:j])
+
+                i = j + 1
+                continue
+
+            if ch.isprintable() and ch != "\x1b":
+                self._press(ch.lower())
+
+            i += 1
+
+    def poll(self, timeout):
+        """读一次输入，返回“当前按着”的键集合。"""
+        try:
+            r, _, _ = select.select([self.fd], [], [], timeout)
+        except InterruptedError:
+            r = []
+
+        if r:
+            try:
+                data = os.read(self.fd, 64).decode("latin-1")
+            except OSError:
+                data = ""
+
+            if data:
+                self._feed(data)
+
+        # kitty 模式有真的“抬起”事件；退回模式只能靠“多久没再看到它”来推断松开
+        if self.kitty is not True:
+            now = time.monotonic()
+            for key in [k for k, t in self.down.items() if now - t > self.release_s]:
+                del self.down[key]
+
+        return set(self.down)
+
+
+def keys_to_wheels(pressed, speed, turn):
+    """按键集合 → (左轮 rpm, 右轮 rpm)。
+
+    「左转」= 车头往左 = 左轮慢/后退、右轮快/前进（差速底盘就这一条规则）。
+    前后左右可以叠加：w+d = 一边前进一边往右拐（左轮快、右轮慢）。
+    """
+    if " " in pressed:                          # 空格 = 急停（按住期间就是 0）
+        return 0.0, 0.0
+
+    fwd = (1 if "w" in pressed else 0) - (1 if "s" in pressed else 0)
+    rot = (1 if "a" in pressed else 0) - (1 if "d" in pressed else 0)
+
+    return fwd * speed - rot * turn, fwd * speed + rot * turn
+
+
+# ---------------------------------------------------------------------------
 # 子命令
 # ---------------------------------------------------------------------------
 def cmd_setup(dev, args):
-    """上电 + 两台都使能并切到速度环（小车开跑前的"点火"）。"""
+    """上电 + 两台都使能并切到速度环（小车开跑前的“点火”）。"""
     print("① 电机电源上电（PC14）…")
     power_on(dev)
 
-    print(f"② 两台使能 + 切速度环{'，加速时间 %d ms/rpm' % args.accel if args.accel is not None else ''}…")
-    for motor in range(1, ota.N_MOTORS + 1):
-        bus_id = ensure_speed_loop(dev, motor, args.accel)
+    accel = getattr(args, "accel", None)
+    print(f"② 两台使能 + 切速度环{'，加速时间 %d ms/rpm' % accel if accel is not None else ''}…")
+    for motor in range(1, proto.N_MOTORS + 1):
+        bus_id = ensure_speed_loop(dev, motor, accel)
         print(f"  电机{motor}（总线 ID{bus_id}）：速度环 OK")
 
     print("③ 里程差闭环（走直线用）：把左轮告诉设备")
@@ -327,7 +490,7 @@ def cmd_setup(dev, args):
 def cmd_status(dev, args):
     """看两台电机：在哪台、什么模式、位置/里程/故障码。"""
     motor_arg = getattr(args, "motor", 0)
-    motors = [motor_arg] if motor_arg else list(range(1, ota.N_MOTORS + 1))
+    motors = [motor_arg] if motor_arg else list(range(1, proto.N_MOTORS + 1))
 
     for motor in motors:
         st = read_status(dev, motor)
@@ -358,7 +521,7 @@ def cmd_spin(dev, args):
 
 
 def pos_delta(p_from, p_to):
-    """两个位置值之间"实际转了多少计数"：位置一圈是 0~32767 且 32767 与 0 是同一点，
+    """两个位置值之间“实际转了多少计数”：位置一圈是 0~32767 且 32767 与 0 是同一点，
     所以按**最短路径**折一下（和固件里 motor_drive.c 用的是同一套算法）。"""
     d = p_to - p_from
 
@@ -374,7 +537,7 @@ def cmd_drive(dev, args):
     """两轮一起跑（按 id 存的左右映射）。直行就给一样的值，原地转就给一正一负。
 
     两台走的是**同一条** DRIVE 命令（起步差 ~10ms）；收尾会把两台各自走了多少计数打出来
-    —— 两台之差就是"这一段歪了多少"（差值大就说明闭环没开好或者轮径差太大）。
+    —— 两台之差就是“这一段歪了多少”（差值大就说明闭环没开好或者轮径差太大）。
     """
     m = load_map()
     speeds = wheel_speeds(args.left, args.right, m)
@@ -415,16 +578,28 @@ def cmd_drive(dev, args):
 
 
 def cmd_stop(dev, args):
-    """停车。默认只给 0 转速（保持在速度环里，还能马上再开）；
-    --disable 会连失能 + 断电机电源一起做（收工/要动线的时候用）。"""
+    """停车。默认只给 0 转速（保持在速度环里，还能马上再开）。
+
+    两个开关各管一件事，互不影响：
+      --disable   失能（电机不使劲，但还通着电、还能读状态）
+      --poweroff  断电机电源（PC14）
+    收工就都写：`car.py stop --disable --poweroff`（或再 `motor.py pwoff`）。
+    """
     print("停车：")
     stop_all(dev)
 
     if args.disable:
-        print("失能 + 断电：")
+        print("失能（不碰电源）：")
         st, _, _ = ctrl(dev, CTRL_DISABLE, 0, 0, timeout=10.0)
-        print(f"  {'OK' if st == ota.ST_OK else ota.ST_TEXT.get(st, st)}")
-        print("  ⚠ 下次要动之前先 `car.py setup`（或 ctrl pwron + enable）")
+        print(f"  {'OK' if st == proto.ST_OK else proto.ST_TEXT.get(st, st)}")
+
+    if args.poweroff:
+        print("断电机电源（PC14）：")
+        st, _, _ = ctrl(dev, CTRL_PWR, 0, 0, timeout=10.0)
+        print(f"  {'OK' if st == proto.ST_OK else proto.ST_TEXT.get(st, st)}")
+
+    if args.disable or args.poweroff:
+        print("  ⚠ 下次要动之前先 `car.py setup`（或 motor.py pwron + enable）")
 
 
 def cmd_id(dev, args):
@@ -440,20 +615,20 @@ def cmd_id(dev, args):
 
     # ⚠ 0 在 spin/drive 里是「一直转」—— 在这条命令里没有意义，只会看起来像卡住
     if args.seconds <= 0:
-        raise ota.OtaError("id 的 --seconds 必须 > 0（0 = 一直转，只对 spin/drive 有意义）")
+        raise proto.OtaError("id 的 --seconds 必须 > 0（0 = 一直转，只对 spin/drive 有意义）")
 
     print("先上电 + 两台都切到速度环：")
     power_on(dev)
-    for motor in range(1, ota.N_MOTORS + 1):
+    for motor in range(1, proto.N_MOTORS + 1):
         ensure_speed_loop(dev, motor)
         print(f"  电机{motor}: 速度环 OK")
     print()
 
-    for motor in range(1, ota.N_MOTORS + 1):
+    for motor in range(1, proto.N_MOTORS + 1):
         print(f"===== 现在动 **电机{motor}**（总线 ID{motor}）：{args.rpm:+.0f} rpm "
               f"持续 {args.seconds:.1f}s =====")
         hold(dev, {motor: args.rpm}, args.seconds)
-        time.sleep(1.0)         # 留一点空档，好区分"哪一段是哪台"
+        time.sleep(1.0)         # 留一点空档，好区分“哪一段是哪台”
 
     m = load_map()
 
@@ -472,7 +647,7 @@ def cmd_id(dev, args):
     answers = {}        # 电机号 → ("l"/"r", "f"/"b")
 
     try:
-        for motor in range(1, ota.N_MOTORS + 1):
+        for motor in range(1, proto.N_MOTORS + 1):
             side = ask(f"电机{motor}（{args.rpm:+.0f}rpm）转的时候，是哪一侧的轮子在转？"
                        f" [l]左边 / [r]右边 / [s]没看清", ("l", "r", "s"))
 
@@ -531,19 +706,19 @@ def cmd_watch(dev, args):
     """按固定间隔读两台的状态，并用**编码器**算出实际转速（验证速度环跟得上没有）。
 
     转速是拿 (里程 x 一圈 + 位置) 的差分算的：位置一圈是 0~32767、到顶会翻回 0
-    （同时里程 +1），所以差分要按"最短路径"折一下。
+    （同时里程 +1），所以差分要按“最短路径”折一下。
     """
     prev = {}
     t0 = time.time()
 
     print(f"每 {args.interval:.2f}s 读一次（Ctrl+C 停）。转速由编码器差分算出来，"
-          f"和 `ctrl speed` 给的值对比着看")
+          f"和给的值对比着看")
 
     try:
         while True:
             elapsed = time.time() - t0
 
-            for motor in range(1, ota.N_MOTORS + 1):
+            for motor in range(1, proto.N_MOTORS + 1):
                 st = read_status(dev, motor)
 
                 if st is None:
@@ -599,7 +774,7 @@ def cmd_map(dev, args):
 
     if any(v is not None for v in (args.left, args.right, args.invert_left, args.invert_right)):
         if m["left"] == m["right"]:
-            raise ota.OtaError("左轮和右轮不能是同一台电机（left == right）")
+            raise proto.OtaError("左轮和右轮不能是同一台电机（left == right）")
         save_map(m)
         print(f"已更新 {MAP_PATH}")
 
@@ -609,25 +784,134 @@ def cmd_map(dev, args):
           f"{'（反向）' if m.get('invert_right') else ''}")
 
 
+def cmd_teleop(dev, args):
+    """键盘遥控：按住就走、松手就停（w/a/s/d，空格急停，q 退出）。
+
+    ⚠ “松手就停”在终端里没有天然事件：终端只在**按下**（和自动重复）时发字符，
+      **松开什么都不发**。所以两条路都备着，跑起来时会打印用的是哪一种：
+        ① kitty 键盘协议（VS Code / kitty / wezterm 支持）：抬起事件 → 立刻停；
+        ② 自动重复超时推断：超过 --release-ms 没再收到那个字母就算松手。
+      另外还有**看门狗**兜底（--watchdog-ms）：松手/断线/上位机挂了设备自己停。
+    """
+    turn = args.speed / 2.0 if args.turn is None else args.turn
+    tick = 1.0 / max(1.0, args.rate)
+
+    m = load_map()
+    print("== 遥控前的一次性准备 ==")
+    print("① 上电 + 两台进速度环")
+    power_on(dev)
+    for motor in range(1, proto.N_MOTORS + 1):
+        bus_id = ensure_speed_loop(dev, motor, args.accel)
+        print(f"  电机{motor}（总线 ID{bus_id}）：速度环 OK")
+
+    print("② 左右映射 + 里程差闭环")
+    print(f"  左轮 = 电机{m['left']}{'（反向）' if m.get('invert_left') else ''}，"
+          f"右轮 = 电机{m['right']}{'（反向）' if m.get('invert_right') else ''}"
+          f"   ← tools/car_map.json")
+
+    if args.no_trim:
+        ctrl(dev, CTRL_TRIM, 0, 0, timeout=6.0)
+        print("  里程差闭环：已关（--no-trim）")
+    else:
+        ensure_trim(dev, m["left"])
+
+    print(f"\n== 遥控中 ==\n"
+          f"  w/s = 前进/后退 {args.speed:.0f}rpm，a/d = 原地转 {turn:.0f}rpm，空格 = 急停，q = 退出\n"
+          f"  发送 {args.rate:.0f}Hz，看门狗 {args.watchdog_ms}ms（松手/断线设备自己停）")
+
+    if not sys.stdin.isatty():
+        raise proto.OtaError("这个终端不能实时读按键（stdin 不是 tty）—— 在 VS Code 的终端里跑，"
+                             "别用管道/重定向")
+
+    keys = Keys(args.release_ms)
+    told_mode = False
+    failures = 0
+    last_line = ""
+    idle_sent = False       # 上一拍已经“发过一次 0 且当时就停着”（那就别每 50ms 再发一遍）
+
+    try:
+        with keys:
+            while True:
+                pressed = keys.poll(tick)
+
+                if (not told_mode) and (keys.kitty is not None) and pressed:
+                    told_mode = True
+                    print("  [输入] " + ("kitty 协议：能收到真正的「抬起」事件"
+                                        if keys.kitty else
+                                        f"自动重复推断：松开 {args.release_ms}ms 后停车"))
+
+                if "q" in pressed:
+                    break
+
+                left, right = keys_to_wheels(pressed, args.speed, turn)
+                speeds = wheel_speeds(left, right, m)
+                moving = bool(pressed) and (left != 0.0 or right != 0.0)
+
+                # 停着的时候就别再刷了：目标已经是 0，设备不需要心跳
+                # （设备侧还没停的靠它自己的看门狗；停好之后就安安静静待着）
+                if (not moving) and idle_sent:
+                    continue
+
+                try:
+                    set_speeds_together(dev, speeds, args.watchdog_ms, quiet=True)
+                    failures = 0
+                    idle_sent = not moving
+                except proto.OtaError as e:
+                    failures += 1
+                    print(f"\n  ⚠ 命令发不出去（第 {failures} 次）：{e}")
+                    if failures >= 5:
+                        print("  连着 5 次失败：退出（设备侧的看门狗会自己把车停下来）")
+                        return 1
+                    time.sleep(0.2)
+                    continue
+
+                mode = "停" if not pressed else "+".join(sorted(pressed))
+                line = (f"  [{mode:<6}] 左={left:+6.1f} 右={right:+6.1f} rpm"
+                        f"  →  电机1={speeds.get(1, 0.0):+6.1f} 电机2={speeds.get(2, 0.0):+6.1f}")
+
+                if line != last_line:
+                    sys.stdout.write("\r" + " " * len(last_line) + "\r" + line)
+                    sys.stdout.flush()
+                    last_line = line
+    except KeyboardInterrupt:
+        print("\n  Ctrl+C")
+    finally:
+        print()
+        try:
+            # 停车：两台一起，并把看门狗清掉
+            set_speeds_together(dev, {1: 0.0, 2: 0.0}, 0)
+            print("  已停车")
+            if args.disable:
+                st, _, _ = ctrl(dev, CTRL_DISABLE, 0, 0, timeout=10.0)
+                print(f"  已失能（不碰电源）：{proto.ST_TEXT.get(st, st)}")
+            if args.poweroff:
+                st, _, _ = ctrl(dev, CTRL_PWR, 0, 0, timeout=10.0)
+                print(f"  已断电机电源（PC14）：{proto.ST_TEXT.get(st, st)}")
+            if not (args.disable and args.poweroff):
+                print("  （收工就把两件都做：`car.py stop --disable --poweroff`）")
+        except proto.OtaError as e:
+            print(f"  ⚠ 停车失败：{e} —— 按板子复位，或拔电机电源")
+
+    return 0
+
+
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="两轮差速小车测试框架（速度环）",
+        description="两轮差速小车上位机（速度环：识别左右轮 / 差速走 / 键盘遥控）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
-    ap.add_argument("--port", default=ota.DEFAULT_PORT,
-                    help=f"电脑这边的串口，默认 {ota.DEFAULT_PORT}（也可以设环境变量 CAR_PORT）")
-    ap.add_argument("--baud", type=int, default=921600)
+    proto.add_port_args(ap)
 
-    sub = ap.add_subparsers(dest="action", required=True)
+    sub = proto.add_subparsers(ap, dest="action", required=True)
 
-    p = sub.add_parser("setup", aliases=["scan"], help="上电 + 两台使能 + 切速度环")
+    p = sub.add_parser("setup", aliases=["scan"], help="上电 + 两台使能 + 切速度环 + 配闭环")
     p.add_argument("--accel", type=int, default=None,
                    help="顺便设加速时间（每 1rpm 多少 ms，0..255）；不填就不动")
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("status", help="两台电机的模式/位置/里程/故障码")
-    p.add_argument("--motor", type=int, default=0, help="只看这一台（1/2）")
+    p.add_argument("--motor", type=int, default=0, help=f"只看这一台（1..{proto.N_MOTORS}）")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("id", help="识别哪台是左轮（依次点动两台，然后逐台问你）")
@@ -637,7 +921,7 @@ def main():
     p.set_defaults(func=cmd_id)
 
     p = sub.add_parser("spin", help="单轮点动（只动一台）")
-    p.add_argument("--motor", type=int, required=True, choices=range(1, ota.N_MOTORS + 1),
+    p.add_argument("--motor", type=int, required=True, choices=range(1, proto.N_MOTORS + 1),
                    help="动哪一台（1/2）")
     p.add_argument("--rpm", type=float, default=15.0, help="转速 rpm，带符号（默认 15）")
     p.add_argument("--seconds", type=float, default=2.0, help="转多久（默认 2s；0 = 一直转到 Ctrl+C）")
@@ -649,14 +933,30 @@ def main():
     p.add_argument("--seconds", type=float, default=2.0, help="跑多久（默认 2s；0 = 一直转到 Ctrl+C）")
     p.set_defaults(func=cmd_drive)
 
-    p = sub.add_parser("stop", help="停车（--disable 连失能 + 断电）")
-    p.add_argument("--disable", action="store_true", help="顺带失能两台并断开电机电源")
+    p = sub.add_parser("stop", help="停车（--disable 失能 / --poweroff 断电）")
+    p.add_argument("--disable", action="store_true", help="顺带失能两台（不碰电源）")
+    p.add_argument("--poweroff", action="store_true", help="顺带断开电机电源（PC14）")
     p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("watch", help="看两台的实际转速（编码器差分算的）")
     p.add_argument("--interval", type=float, default=0.2, help="采样间隔秒（默认 0.2）")
     p.add_argument("--seconds", type=float, default=0.0, help="看多久（默认 = 一直看到 Ctrl+C）")
     p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("teleop", help="键盘遥控：按住就走、松手就停（w/a/s/d，空格急停，q 退出）")
+    p.add_argument("--speed", type=float, default=30.0, help="前进/后退的 rpm（默认 30）")
+    p.add_argument("--turn", type=float, default=None, help="原地转的 rpm（默认 = --speed 的一半）")
+    p.add_argument("--rate", type=float, default=20.0, help="发送频率 Hz（默认 20，即 50ms 一条）")
+    p.add_argument("--watchdog-ms", type=int, default=400,
+                   help="松手/断线后设备自己停车的超时（默认 400ms；0 = 不启用，不推荐）")
+    p.add_argument("--release-ms", type=int, default=250,
+                   help="终端不支持 key-up 时，多久没再收到某个键就算松开了（默认 250ms）")
+    p.add_argument("--accel", type=int, default=None,
+                   help="顺便设加速时间（每 1rpm 多少 ms）；不填就不动")
+    p.add_argument("--no-trim", action="store_true", help="关掉里程差闭环（纯开环）")
+    p.add_argument("--disable", action="store_true", help="退出时顺带失能（不碰电源）")
+    p.add_argument("--poweroff", action="store_true", help="退出时顺带断开电机电源（PC14）")
+    p.set_defaults(func=cmd_teleop)
 
     p = sub.add_parser("map", help="看/改左右轮映射（不跑 id 时的备用手段）")
     p.add_argument("--left", type=int, choices=(1, 2), default=None)
@@ -673,42 +973,9 @@ def main():
 
     args = ap.parse_args()
 
-    # 只有要碰电机的子命令才需要串口；map 是纯本地的小配置
-    if args.action == "map":
-        try:
-            return cmd_map(None, args) or 0
-        except ota.OtaError as e:
-            print(f"\n❌ {e}", file=sys.stderr)
-            return 1
-
-    try:
-        ota.check_port(args.port)
-        dev = ota.Device(args.port, args.baud, quiet=False)
-    except ota.OtaError as e:
-        print(f"\n❌ {e}", file=sys.stderr)
-        return 1
-    except Exception as e:                      # 权限 / 被占用 / 拔线
-        print(f"\n❌ 打不开 {args.port}：{e}", file=sys.stderr)
-        return 1
-
-    rc = 0
-    try:
-        args.func(dev, args)
-    except ota.OtaError as e:
-        print(f"\n❌ {e}", file=sys.stderr)
-        rc = 1
-    except KeyboardInterrupt:
-        print("\n中断。⚠ 电机可能还在转 —— 跑一次 `car.py stop` 或按板子上的复位")
-        rc = 1
-    except EOFError:
-        print("\n❌ 读不到输入（终端不是交互式的，或者输入被关了）。\n"
-              "   要脚本化就用 `car.py id --no-input`，或者直接 `car.py map ...` 写映射。",
-              file=sys.stderr)
-        rc = 1
-    finally:
-        dev.close()
-
-    return rc
+    # map 是纯本地的小配置，不碰串口
+    return proto.serve(args, args.func, needs_port=(args.action != "map"),
+                       interrupt_msg="⚠ 电机可能还在转 —— 跑一次 `car.py stop` 或按板子复位")
 
 
 if __name__ == "__main__":

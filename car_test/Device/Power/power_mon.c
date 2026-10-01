@@ -65,10 +65,6 @@ static uint8_t       s_cal_ok = 0U;       /* 自校准是否成功 */
 static uint8_t       s_ok     = 0U;       /* 最近一次采样是否成功 */
 static uint8_t       s_state  = PM_ST_UNKNOWN;
 
-/* 电池串数：1..POWER_MON_CELLS_MAX（没有 0，见 power_mon.h）。
-   从 OTA 任务里改（ctrl cells）、从采样任务里读，一个字节的读写是原子的，不用加锁。 */
-static volatile uint8_t s_cells = POWER_MON_DEFAULT_CELLS;
-
 static volatile uint32_t s_mv     = 0U;   /* 缓存：VCC_IN 电压 mV */
 static volatile uint32_t s_pin_mv = 0U;   /* 缓存：PC4 引脚电压 mV */
 static volatile uint16_t s_raw    = 0U;   /* 缓存：原始 ADC 码值 */
@@ -124,10 +120,16 @@ static uint8_t power_mon_convert(uint16_t *raw)
     return 1U;
 }
 
+/* 电池串数：按总压自动判定（现场两种电源量程不重合，见 power_mon.h） */
+static uint8_t power_mon_cells_of(uint32_t mv)
+{
+    return (mv >= POWER_MON_CELLS_SWITCH_MV) ? POWER_MON_CELLS_HIGH : POWER_MON_CELLS_LOW;
+}
+
 /* 单片电压 mV（四舍五入） */
 static uint32_t power_mon_cell_mv(uint32_t mv)
 {
-    uint32_t cells = s_cells;
+    uint32_t cells = power_mon_cells_of(mv);
 
     return (mv + (cells / 2U)) / cells;
 }
@@ -249,16 +251,17 @@ static void power_mon_report(uint8_t state)
         case PM_ST_HIGH:
             (void)snprintf(line, sizeof(line),
                            "[power] OVER-VOLT: cell %s (%u%%) > %s/cell (%uS)\r\n",
-                           cell, (unsigned int)pct, high, (unsigned int)s_cells);
+                           cell, (unsigned int)pct, high,
+                           (unsigned int)power_mon_cells_of(s_mv));
             UartLog_Print(line);
             break;
 
         case PM_ST_LOW:
             (void)snprintf(line, sizeof(line),
                            "[power] LOW: cell %s (%u%% left) < %s/cell (%uS pack, total %s)\r\n",
-                           cell, (unsigned int)pct, low, (unsigned int)s_cells, txt);
+                           cell, (unsigned int)pct, low,
+                           (unsigned int)power_mon_cells_of(s_mv), txt);
             UartLog_Print(line);
-            UartLog_Print("[power]   on the 12V supply? send 'ctrl 12v' (= treat it as 3S)\r\n");
             break;
 
         case PM_ST_OK:
@@ -378,31 +381,9 @@ void PowerMon_Format(char *out, uint32_t out_size, uint32_t mv)
 
 /* ---- 电池串数 / 单片电压 / 告警 ------------------------------------------ */
 
-void PowerMon_SetCells(uint8_t cells)
-{
-    if (cells < POWER_MON_CELLS_MIN)
-    {
-        cells = POWER_MON_CELLS_MIN;
-    }
-
-    if (cells > POWER_MON_CELLS_MAX)
-    {
-        cells = POWER_MON_CELLS_MAX;
-    }
-
-    s_cells = cells;
-
-    /* 立刻按新的串数重判一次：比如带 6S 报警时切到 `ctrl 12v`（3S），
-       12 V 那套就当场不再算低压了，不用等下一次采样（日志只在状态跳变时打，不会刷屏）。 */
-    if (s_ok != 0U)
-    {
-        power_mon_report(power_mon_state_of(s_mv));
-    }
-}
-
 uint8_t PowerMon_GetCells(void)
 {
-    return s_cells;
+    return power_mon_cells_of(s_mv);
 }
 
 uint32_t PowerMon_GetCellMv(void)
@@ -468,7 +449,8 @@ void PowerMon_Start(void)
        长行拆开是因为无线口上太长的一行在串口助手里很难读。 */
     (void)snprintf(line, sizeof(line),
                    "[power] VCC_IN = %s, cell %s (%uS), ~%u%%\r\n",
-                   txt, cell, (unsigned int)s_cells, (unsigned int)PowerMon_GetPercent());
+                   txt, cell, (unsigned int)PowerMon_GetCells(),
+                   (unsigned int)PowerMon_GetPercent());
     UartLog_Print(line);
 
     PowerMon_Format(full, sizeof(full), power_mon_full_scale_mv());

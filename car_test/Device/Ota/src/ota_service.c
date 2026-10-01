@@ -25,7 +25,7 @@
 #include "ota_trace.h"
 #include "motor_ctrl.h"
 #include "motor_power.h"    /* 状态回帧里带上"电机电源是否使能" */
-#include "power_mon.h"      /* 电源电压（PC4/ADC1_INP4）：ctrl vmon + 状态回帧末尾 */
+#include "power_mon.h"      /* 电源电压（PC4/ADC1_INP4）：状态回帧末尾 */
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -38,8 +38,8 @@
    里面有 snprintf（一百多字节）+ HAL 调用，留 2 KB。
 
    ⚠⚠ **改成 3 KB 是实测逼出来的**（2026-09-20）：无线命令这条链很深：
-     OtaService_Task → OnFrame → Ctrl → MotorCtrl_RemoteCmd → 位置跟随
-     → MotorCtrl_PreparePositionLoop → EnterPositionLoop → 日志格式化
+     OtaService_Task → OnFrame → Ctrl → MotorCtrl_RemoteCmd
+     → EnterPositionLoop → 日志格式化
      → Motor_QueryMode → Motor_Transaction → MotorIo_Exchange → xQueueSend
      按 -fstack-usage 的实测帧大小加起来 ~1.7 KB（还没算 newlib 的 snprintf
      和中断栈帧）。
@@ -244,8 +244,8 @@ static void OtaService_ConfirmBoot(void)
  *
  * ⚠ 为什么值得专门做个命令：**栈溢出是不出声的** —— 它只把栈下面的内存悄悄写坏
  *   （在 FreeRTOS 里那往往是堆里紧挨着的另一个对象），然后在完全不相干的地方
- *   以断言/异常的形式暴露出来。2026-09-20 就被坑过一次：位置跟随把无线命令这条
- *   调用链压深了 ~550 字节，otaSvc 的 2 KB 栈溢出，报出来的却是 queue.c 里的
+ *   以断言/异常的形式暴露出来。2026-09-20 就被坑过一次：无线命令这条调用链被压深
+ *   了 ~550 字节，otaSvc 的 2 KB 栈溢出，报出来的却是 queue.c 里的
  *   `pxQueue->uxItemSize == 0`。有个能直接问"还剩多少"的口子，下次就是一眼的事。
  *
  * ⚠ s_status 故意做成 static：一次 CTRL 命令只会有一个任务在跑（otaSvc），
@@ -300,34 +300,6 @@ static void OtaService_Ctrl(uint8_t seq, const uint8_t *pl, uint16_t len)
     if (len < 5U)
     {
         rsp[0] = (uint8_t)OTA_E_PARAM;
-    }
-    else if (pl[0] == OTA_CTRL_VMON)
-    {
-        /* 电源电压（PC4/ADC1_INP4）：这**不是电机的命令**，所以在进
-           MotorCtrl_RemoteCmd 之前就处理掉 —— 好处是升级中、电机已失能、
-           甚至 OTA 模式下都能问电压。
-           值取的是 power_mon 后台任务（1 Hz）的缓存，不在这里现采：
-           ADC 只有一套寄存器状态，两处同时采会互相踩（见 power_mon.h）。 */
-        if (PowerMon_Ok() == 0U)
-        {
-            rsp[0] = (uint8_t)OTA_E_STATE;      /* 还没采到 / 采样失败 */
-        }
-        else
-        {
-            rsp[0] = (uint8_t)OTA_OK;
-            out    = PowerMon_GetMv();          /* data  = 总压 mV */
-            out2   = PowerMon_GetCells();       /* data2 = 电池串数（单片电压由上位机换算） */
-            out3   = PowerMon_GetPercent();     /* data3 = 剩余百分比（按单片电压估，0xFF=无效） */
-        }
-    }
-    else if (pl[0] == OTA_CTRL_CELLS)
-    {
-        /* 电池串数（1..12）：6 = 6S 电池、3 = 12V 那套。不是电机命令，同样在这里处理。 */
-        PowerMon_SetCells((uint8_t)Ota_GetLe32(&pl[1]));
-
-        rsp[0] = (uint8_t)OTA_OK;
-        out    = PowerMon_GetCells();
-        out2   = out;
     }
     else if (pl[0] == OTA_CTRL_STACKS)
     {

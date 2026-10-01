@@ -206,8 +206,8 @@ sequenceDiagram
 | --- | --- |
 | 口 | USART1：PA9=TX、PA10=RX，AF7，**921600** 8N1（`OTA_PORT_BAUD`；要和无线模块的串口波特率一致，
      不自动识别的模块得两边都改。⚠ Bootloader 与 App 共用这个宏，但它不参与 OTA ⇒ **改了波特率就
-     要用 ST-Link 重烧一次 `motor_boot.hex`**（2026-09-19 已烧：BL 恢复台也是 921600，升级时
-     BL 的 `bootloader: …` 日志直接可读） |
+     要用 SWD/ST-Link 重烧一次 `motor_boot.hex`**；两者都是 921600，升级时 BL 的 `bootloader: …`
+     日志直接可读） |
 | 方向 | 全双工；日志是设备→主机，控制/OTA 是双向 |
 | 复用 | **文本日志照旧直接发**（ASCII + `\r\n`），二进制帧用 `0x00` 定界 + COBS 编码 |
 | 为什么不冲突 | ASCII 文本里**永远不出现 `0x00`**，而 COBS 编码后的帧里也**永远不出现 `0x00`** → 主机看到 `0x00` 之间的一段就是「候选帧」，COBS 解出来再验 CRC32；CRC 不过就当成文本忽略。设备侧同理，只认 `0xAA 0x55` 开头的合法帧 |
@@ -260,7 +260,7 @@ sequenceDiagram
 
 | cmd | 含义 | arg |
 | --- | --- | --- |
-| 0x00 | 失能所有电机（0xA0/0x09） | — |
+| 0x00 | 失能所有电机（0xA0/0x09，不动电源） | — |
 | 0x01 | 使能（重试到应答） | — |
 | 0x02 | 切位置环（0xA0/0x03） | — |
 | 0x03 | 走位置 | 0..32767 |
@@ -269,15 +269,12 @@ sequenceDiagram
 | 0x06 | 静音日志（OTA 前会自动开） | 0/1 |
 | 0x07 | 暂停/恢复 200 ms 状态轮询 | 0/1 |
 | 0x08 | 电机电源（PC14 可控电源输出，高电平使能） | 0=断电、1=上电（等稳定）、2=断电重启 |
-| 0x09 | 读电源电压（PC4/ADC1_INP4 分压取样，**不是电机命令**） | — （`data`=总压 mV、`data2`=电池串数、`data3`=剩余 %） |
-| 0x0A | 设置电池串数（算“单片电压”用，**不是电机命令**） | 1..8（6=6S 电池、3=12V 那套） |
-| 0x0B | 位置跟随：2 号机当遥控端、1 号机跟着转（§5.4.3） | 0=停 / 其它=跟随周期 ms（< 5 按默认 20 算） |
-| 0x0C | 让 leader（2 号机）自动匀速转（跟随的“驱动器”） | 转速，单位 **0.1°/s**（0=停） |
 | 0x0D | 打印每个任务的**栈余量**（只读诊断，**不是电机命令**） | — |
 
 > **PC14 那路电源**：上电**默认关断**（`main()` 里 `MotorPwr_Init()` 就把它配成输出并拉低）。
-> 按 USER_KEY 或发 `ctrl enable` 时会先上电并等 `MOTOR_PWR_SETTLE_MS`(500 ms) 再发使能帧；
-> 发 `ctrl disable` / 进 OTA 模式会把它一并切掉。`ctrl pwr` 的回复 `data` 是当前状态（0/1）。
+> 发 `motor.py enable` / `speedloop` / `drive` 时会先上电并等 `MOTOR_PWR_SETTLE_MS`(500 ms) 再发使能帧；
+> `0x00`（失能）和进 OTA 模式都**不碰这一路电源**，断电要显式发 `motor.py pwoff`。
+> `motor.py pwr` 的回复 `data` 是当前状态（0/1）。
 > 升级期间只允许 `arg=0`（断电）—— 正在擦写 Flash 时不该把电机重新上电。
 > ⚠ PC14/PC15 是 OSC32 引脚（板载没焊 32.768 kHz 晶振才能这么用），属备份域、驱动能力很弱，
 > **只能当使能信号**用，电流得电源那边出。
@@ -287,50 +284,7 @@ sequenceDiagram
 
 > **`CTRL_CMD` 的回帧布局**（13 字节）：`status(1) data(4) data2(4) data3(4)`。
 > `data2`/`data3` 是后加的（只为新命令服务，用不上时填 0），**尾部追加 ⇒ 老上位机只读
-> 前 5 字节照常能用**。（曾有一段时间文档里写的是 9 字节：加 vmon 的剩余百分比时
-> 又追加了 `data3`，这里没跟上 —— 以 `Device/Ota/inc/ota_layout.h` 为准。）
-
-### 5.4.3 位置跟随（2 号机遥控 → 1 号机跟随，2026-09-20 加）
-
-需求：**2 号机当遥控端（自动转或人手拖），1 号机尽量实时跟着转**。
-
-一句话做法：
-**每一拍读一次 leader 的实测位置，按“起始基准 + 增量”当成 follower 位置环的目标发过去**。
-闭环在设备里，上位机只负责开/关
-（走上位机中继的话，光一趟链路延迟就是几十 ms 起步，压根跟不上）。
-
-```
-每拍（默认 20 ms）:
-  ① （可选）给 leader 推一个新的目标位置 → 它就会匀速转
-  ② 读 leader 的 0x74（里程 + 位置） → 拼成“绕轴角度”
-  ③ 把 follower 的目标（起始位置 + leader 走过的增量）发 0x64
-  ④ 读 follower 的 0x74 → 算跟随误差 + 防跑飞
-```
-
-几个关键取舍（详情见 `Device/Motor/motor_follow.c` 的文件头注释）：
-
-- **只用“读位置”**：leader 是遥控端，它怎么动都行（我方自动匀速转 / 人手拖 / 失能滑转），
-  `0x74` 一查就有位置 ⇒ 跟随循环从不依赖 leader 的控制模式，也（除了 spin）不去动它的状态。
-- **增量式对齐**：`目标 = follower 起始角度 + (leader 当前角度 - leader 起始角度)`。
-  两台各自的零点都有一段偏置（实测静止在 0° 时位置值报 61 而不是 0），用增量就不用标定它。
-- **用“里程 × 32768 + 位置”拼成绝对角度**：位置值只有一圈（0..32767，而且 32767 ≡ 0），
-  直接拿它当角度会在过零点跳变，也无法表达多圈；位置环又是“走最短路径”，
-  一拍转过 180° 就会反向抄近路。
-- **周期不可能很快**：两台电机在**同一条 38400 单总线**上一问一答，一个来回 ~3 ms，
-  一拍要 3~4 条帧 ⇒ 实测 50~150 Hz（日志里的 `rate=` 就是实测值）。
-- **安全阀**（跟随是“电机自己在动”的功能，防护比功能本身重要）：
-  leader 一拍位置突变 > 90° ⇒ 当假数据丢掉、只重新对齐基准；
-  跟随误差 > 一圈 ⇒ 判失控（急停 + 失能 + 断电）；连续 5 拍读不到任一电机 ⇒ 中止；
-  任何手动命令（除指名 2 号机的）都会先停跟随 —— 否则跟随循环下一拍就把电机拽回目标位置。
-
-用法（三个命令就够）：
-
-```bash
-python tools/ota.py --port COM7 ctrl follow      # 开始跟随（默认周期 20 ms；会先给电机上电）
-python tools/ota.py --port COM7 ctrl spin 900     # 再让 2 号机以 90.0°/s 自动转
-python tools/ota.py --port COM7 ctrl follow 0    # 停止（回复里带实测周期和平均跟随误差）
-# 实时数字看设备日志的 [follow] 行（每秒两行：进度/总线 + 跟随质量）
-```
+> 前 5 字节照常能用**（现在只有 `trim` 用到了 `data3`，其余命令最多用到 `data2`）。
 
 ### 5.4.2 电源电压监测（2026-09-19 加）
 
@@ -348,8 +302,9 @@ $3.3\ \text{V} \times 11 \approx 36.3\ \text{V}$，12 V 开关电源和 6S 电�
 * 全量程按 `hadc1.Init.Resolution` 算（不是写死 65535）：以后改分辨率不会静默算错。
 * “超量程告警”的阈值**必须小于满量程 36.3 V**（取 34 V）：ADC 在 36.3 V 就饱和卡在 65535，
   阈值写 40 V 的话这个告警永远不会触发。
-* **单片电压只有一个旋钮：电池串数**（1..12，RAM 里，默认 6）。12 V 那套统一按 3S 算
-  （12.0 V ⇒ 4.00 V/片，落在 3.30~4.25 V 窗口中间，不会误报）。
+* **单片电压的串数是自动判的**（按总压，不需要设）：两种电源量程不重合 —— 6S 电池 19.8~25.5 V
+  按 6 串算，12 V 开关电源（9.9~12.75 V）按 3 串算，分界取 16 V。
+  12.0 V ⇒ 4.00 V/片，落在 3.30~4.25 V 窗口中间，不会误报。
   故意**不做**“0 = 不判单片”这种特例：有特例就得多一堆 `cells==0` 分支，换算/告警/显示
   就不是同一条路了。
 * `status` 回帧末尾追加 `vmv(2) cells(1) flags(1)`（flags: b0 低压 / b1 过压 / b2 读数无效），
@@ -369,10 +324,12 @@ $3.3\ \text{V} \times 11 \approx 36.3\ \text{V}$，12 V 开关电源和 6S 电�
 | `motor` | 失能 / 急停这类安全命令 | 使能 / 切位置环 / 走位 / status |
 | --- | --- | --- |
 | 不填（或 0） | **全部**电机 | **1 号机** |
-| 1..MOTOR_COUNT | 只作用于那一台（**不会切电源**） | 那一台 |
+| 1..MOTOR_COUNT | 只作用于那一台 | 那一台 |
+
+（`CTRL_CMD` 里只有 `0x08` 会动 PC14 那一路电源，其它命令一律只“失能/使能/给值”。）
 
 序号越界返回 `OTA_E_PARAM`。为什么默认值两边不一样：安全命令默认"全都停"更安全，
-而运动命令默认 1 号机能保证老的命令行（`ctrl movepos 8191`）行为完全不变。
+而运动命令默认 1 号机能保证老的命令行（`motor.py movepos 8191`）行为完全不变。
 
 ### 5.5 时序/重传参数（默认值，两边都要能配）
 
@@ -467,7 +424,8 @@ $3.3\ \text{V} \times 11 \approx 36.3\ \text{V}$，12 V 开关电源和 6S 电�
    每次启动/提交只多一条记录，寿命上完全够（几千次擦写 × 512 条）。
 8. **日志要能静音**：OTA 期间把日志关掉（`UartLog_SetEnabled(0)`），别让每 200 ms 两行状态日志
    抢走带宽；升级结束或超时后自动恢复。
-9. **电机安全**：`OTA_BEGIN` 里强制失能 + 停轮询；升级完成后由用户自己再按键/发命令使能。
+9. **电机安全**：`OTA_BEGIN` 里强制失能 + 停轮询（不碰电源）；升级完成后不会自动转，
+   要动得用户自己再发 `motor.py enable` / `speedloop`。
 10. **上位机侧 CRC 要和设备一致**：Python 直接用 `zlib.crc32()`；设备侧 `ota_crc.c` 是同一套
     （自检 `"123456789"` → `0xCBF43926`）。
 11. **跳转前 `__enable_irq()`**：BL 关过中断，不打开的话 App 会「活着但所有中断都不响应」
@@ -564,7 +522,10 @@ Device/Ota/
   src/*.c             对应实现
 cmake/ota.cmake       三个构建目标（App-SlotA / App-SlotB / Bootloader）
 STM32H723xG_slots.ld  App 和 BL 共用的链接脚本（基址靠 --defsym APP_BASE 传）
-tools/ota.py          上位机：查询 / 升级 / 续传 / 回滚 / 监视日志
+tools/ota.py          上位机：查询 / 升级 / 续传 / 回滚 / 监视日志（只管升级）
+tools/motor.py        上位机：电机命令（使能/切环/转速/走位/电源/电压…）
+tools/car.py          上位机：小车（左右轮识别 / 差速走 / 键盘遥控）
+tools/proto.py        上面三个共用的协议层（串口 / COBS / CRC32 / 组帧）
 ```
 
 | 构建目标 | 产物 | 链接基址 | 说明 |
@@ -578,15 +539,18 @@ tools/ota.py          上位机：查询 / 升级 / 续传 / 回滚 / 监视日�
 
 ```bash
 python tools/ota.py selftest                         # 先跑这个：不连板子，自检 CRC32/COBS/组帧
-python tools/ota.py --port COM7 info                 # 看当前在哪个槽、版本、CRC
-python tools/ota.py --port COM7 flash build/Debug/motor_control_slotB.bin
-python tools/ota.py --port COM7 upgrade        # 不带文件：自动挑槽 + 自动挑镜像（日常就用这个）
-python tools/ota.py --port COM7 rollback             # 新固件有问题 → 切回旧槽
-python tools/ota.py --port COM7 reboot --boot        # 重启进 Bootloader 恢复台（救砖）
-python tools/ota.py --port COM7 monitor              # 当串口监视器看日志
-python tools/ota.py --port COM7 status               # 电机里程/位置/故障码
-python tools/ota.py --port COM7 ctrl disable         # 电机控制：disable/enable/posloop/movepos/...
+python tools/ota.py info                             # 看当前在哪个槽、版本、CRC
+python tools/ota.py flash build/Debug/motor_control_slotB.bin
+python tools/ota.py upgrade                    # 不带文件：自动挑槽 + 自动挑镜像（日常就用这个）
+python tools/ota.py rollback                         # 新固件有问题 → 切回旧槽
+python tools/ota.py reboot --boot                    # 重启进 Bootloader 恢复台（救砖）
+python tools/ota.py monitor                          # 当串口监视器看日志
 ```
+
+串口不写就自动找（只有一个 USB 串口时直接用它），要换就 `--port COM7`（写在子命令
+前后都行）或设环境变量 `CAR_PORT`。
+
+> 电机/小车命令在 `tools/motor.py` 和 `tools/car.py`（同一个口，共用 `tools/proto.py`）。
 
 `ota.py` 会自己挑文件：设备报「活动槽 = A」时，它要求你给 B 槽的 bin
 （`xxx_slotB.bin`）；给错了会拒绝并提示（避免把 A 的镜像写进 B 槽 → 跳过去必崩）。
@@ -608,14 +572,15 @@ python tools/ota.py --port COM7 ctrl disable         # 电机控制：disable/en
    我们的上层只加 `Device/Power/`。重新生成时别把 ADC1 取消，也**不要把采样时间调短**
    （源阻抗 ≈ 91 kΩ，387.5 周期 @48 MHz 才是够的），
    并确认 PC4 = `ADCx_INP4`、`RCC.ADCFreq_Value = 48000000`（PLL2 只服务 ADC，不影响主时钟）。
-5. **BL 和 App 的波特率必须一致**（都用 `OTA_PORT_BAUD`）：BL 不参与 OTA，所以**每次改这个宏，
-   都要用 ST-Link 把 `build/Debug/motor_boot.hex` 烧一遍**，否则 BL 那边还是旧波特率 ——
-   现象是“升级时 BL 的 `bootloader: …` 日志变成乱码”“工具连 20 s 等不到设备回到正常状态”，
-   而且修复只能靠 ST-Link（或按键+手动回退）。建议改波特率时**顺手把 BL 一起烧**。
-5. `Core/Src/freertos.c` 里我们的改动只在 `USER CODE` 段内（日志口换成 USART1、
+5. **BL 和 App 的波特率一致**（都用 `OTA_PORT_BAUD`，`ota_com.c` 就一份代码）：BL 不参与 OTA，
+   所以**每次改这个宏，都要用 SWD/ST-Link 把 `build/Debug/motor_boot.hex` 烧一遍**，
+   否则 BL 恢复台和 App 对不上 —— 现象是“升级时 BL 的 `bootloader: …` 日志变乱码”
+   “工具连 20 s 等不到设备回到正常状态”，而且那时只能靠 SWD 救。
+   所以改波特率时**顺手把 BL 一起烧**。
+6. `Core/Src/freertos.c` 里我们的改动只在 `USER CODE` 段内（日志口换成 USART1、
    建 OTA 任务），CubeMX 不会覆盖。
-6. `Core/Src/main.c` 里只多了一行 `SCB->VTOR = ...`（`USER CODE BEGIN 1`），同样在 USER CODE 段内。
-7. **CubeMX 拥有的 RTOS 开关现在有编译期护栏**（`Core/Inc/FreeRTOSConfig.h` 的 `USER CODE BEGIN 1`）：
+7. `Core/Src/main.c` 里只多了一行 `SCB->VTOR = ...`（`USER CODE BEGIN 1`），同样在 USER CODE 段内。
+8. **CubeMX 拥有的 RTOS 开关现在有编译期护栏**（`Core/Inc/FreeRTOSConfig.h` 的 `USER CODE BEGIN 1`）：
    `configTOTAL_HEAP_SIZE` / `configMAX_PRIORITIES` / `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` /
    `configUSE_TIMERS` / `configUSE_MUTEXES` / `configSUPPORT_{STATIC,DYNAMIC}_ALLOCATION`
    这些**都不在 USER CODE 段里**，`.ioc` 里也没有显式记录（`FREERTOS.IPParameters` 只有
@@ -624,18 +589,18 @@ python tools/ota.py --port COM7 ctrl disable         # 电机控制：disable/en
    （实测 15360 里启动后只剩 ~7 KB）。现在对不上就直接**编译不过**（`_Static_assert`）。
    ⚠ 唯一天然查不了的是 `configTICK_RATE_HZ`：它的值写成 `((TickType_t)1000)`，
    而包含本文件时 `TickType_t` 还没定义，预处理和 `_Static_assert` 都过不去；只能靠人看**保持 1000 Hz**。
-8. **PE2（USART10_RX）的内部上拉**目前写在 `Core/Src/usart.c` 的
+9. **PE2（USART10_RX）的内部上拉**目前写在 `Core/Src/usart.c` 的
    `USER CODE BEGIN USART10_MspInit 1`（电机没接时 RX 悬空会被噪声刷出假字节，见 §7 第 20 条）。
    它随 USER CODE 一起保留，但 CubeMX 的引脚模型里没有它 —— 想"正规"一点就在 CubeMX 里
    设 PE2 → Pull-up，然后把手写那段删掉（两者同时存在只是多初始化一次，无害）。
-9. 重新生成后**确认这四项没变**：PE3 = USART10_TX + **Open Drain**、PE2 = USART10_RX、
+10. 重新生成后**确认这四项没变**：PE3 = USART10_TX + **Open Drain**、PE2 = USART10_RX、
    PA9/PA10 保持未分配、USART10 波特率 38400；以及 **`NVIC.TimeBase` 仍是 TIM6**（`SYS` 的
    Timebase Source = TIM6，SysTick 留给 FreeRTOS）。任何一项错了，电机总线、无线口、
    或者整个系统的节拍就会出问题 —— 尤其 Timebase 如果被改回 SysTick，
    `HAL_InitTick` 就会变成 HAL 的弱实现，和 FreeRTOS 的 SysTick 抢中断（见 §7 第 12 条）。
-10. 生成完的**验证流程**：重新编译 → 烧 `motor_control.hex` → 看串口里
+11. 生成完的**验证流程**：重新编译 → 烧 `motor_control.hex` → 看串口里
     `[app] I2: all threads created -> start scheduler [free heap=7288]`（应该还有 7 KB 上下）。
-    这个数字掉到很小或者干脆卡在 `H3/H4` 之间，就是某个 CubeMX 开关被改了（见第 7 条）。
+    这个数字掉到很小或者干脆卡在 `H3/H4` 之间，就是某个 CubeMX 开关被改了（见第 8 条）。
 
 ---
 

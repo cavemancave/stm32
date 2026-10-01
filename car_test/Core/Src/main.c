@@ -44,17 +44,14 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* 电机相关的参数（MOTOR_COUNT / KEY_DEBOUNCE_MS / USER_KEY_PRESSED_LEVEL /
-   轮询周期 ...）都搬到 Device/Motor/motor_ctrl.c 了，要改去那边改。
+/* 电机相关的参数（MOTOR_COUNT / 速度环量纲 / 轮询周期 ...）在
+   Device/Motor/inc/motor_ctrl.h 和 Device/Ota/inc/ota_layout.h 里，要改去那边改。
    这里只留 main.c 自己用得到的。 */
 
 /* ---- 板载 WS2812 指示灯 ----
-   颜色用枚举（见 ws2812.h 的 WS2812_COLOR_xxx），亮度不在主流程里设，
-   用驱动里的"总亮度"默认值 WS2812_DEFAULT_BRIGHTNESS(32)——要调就改 ws2812.h 那个宏，
-   或者开机时自己调 WS2812_SetBrightness()。
-   点灯的状态机（MotorCtrl_LedNextColor）搬到了 Device/Motor/motor_ctrl.c，
-   顺序不变：
-   RED → GREEN → BLUE → YELLOW → CYAN → MAGENTA → WHITE → RED ...（跳过 OFF） */
+   main() 上电时只发一帧全灭（MCU 单独复位时灯珠会保留上一次的颜色）。
+   颜色 / 亮度接口见 Device/WS2812/inc/ws2812.h
+   （WS2812_SetColor / WS2812_SetBrightness）。 */
 
 /* 使能可控 5V 之后，等 5V 轨稳定再说：板载 WS2812（以及后面的 BMI088）都吃这一路。
    BMI088 数据手册要求 VDD 有效后加速度计 ~1ms、陀螺仪 ~30ms 才能访问，
@@ -185,7 +182,7 @@ int main(void)
 
   /* 电机电源（PC14）：**上电默认关断**。趁早把它配成推挽输出并拉低 ——
      复位后到配好之前，那根使能线是悬空的（高电平就会上电），越早配越安全。
-     真正的使能在“按 USER_KEY / 无线 ctrl enable”时才做。
+     真正的使能在“无线 ctrl enable / speedloop / drive”时才做。
      注意它是和板载 5V（PC15）**两路独立**的供电：5V 给 WS2812/BMI088，
      PC14 这路给电机（及其驱动板）。 */
   MotorPwr_Init();
@@ -241,138 +238,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-#if 0 /* ---- 旧主循环：按键使能 + 200ms 状态轮询 ----
-         已搬到 Device/Motor/：控制流程见 motor_ctrl.c 的 MotorCtrl_Task()，
-         状态轮询见 MotorCtrl_PollTask()。留在这里备查，不再编译。 ---- */
-    /* 等一次按键（PA15），按下后：给总线上每台电机各发一次使能指令
-       （0xA0/0x08，只发一次、不重试），再把串口收到的 10 字节原样打到 UART7。 */
-    Uart7_Print("press USER_KEY (PA15) to send enable ...\r\n");
-
-    WaitUserKeyPress();
-
-    key_round++;
-    WS2812_SetColor(Motor_LedNextColor());   /* 按键已按下：换下一个颜色 */
-
-    (void)snprintf(motor_line, sizeof(motor_line),
-                   "key pressed (#%u), sending enable (0xA0/0x08)...\r\n",
-                   (unsigned int)key_round);
-    Uart7_Print(motor_line);
-
-    uint8_t enabled_ok = 0U;
-
-    for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
-    {
-      /* 只发一次使能：Motor_Enable 内部收发各有 100ms 超时。
-         注意：反馈里 DATA[2] 是**使能之后的实际模式**，不是回显 0x08 ——
-         实测回帧 01 A1 01 00 00 00 00 00 00 E0，模式值 0x01 = 默认的电流环。
-         所以只要收到合法的 0xA1 回帧，就说明使能指令被电机接受了。 */
-      uint8_t ack_ok = Motor_Enable(motor_ids[i], &motor_enable_ack[i]);
-
-      /* 不管成没成，都把 RX 收到的 10 字节原样打出来：
-         全 0 = 一个字节都没收到（没接线/没上电/波特率不对），
-         有数据但校验不过 = 波特率或 CRC 对不上（见 motor.h 的协议说明）。 */
-      (void)snprintf(motor_line, sizeof(motor_line),
-                     "id=%u enable sent, reply=%s, rx="
-                     "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-                     (unsigned int)motor_ids[i], (ack_ok != 0U) ? "OK" : "NONE",
-                     motor_enable_ack[i].raw[0], motor_enable_ack[i].raw[1],
-                     motor_enable_ack[i].raw[2], motor_enable_ack[i].raw[3],
-                     motor_enable_ack[i].raw[4], motor_enable_ack[i].raw[5],
-                     motor_enable_ack[i].raw[6], motor_enable_ack[i].raw[7],
-                     motor_enable_ack[i].raw[8], motor_enable_ack[i].raw[9]);
-      Uart7_Print(motor_line);
-
-      if (ack_ok != 0U)
-      {
-        (void)snprintf(motor_line, sizeof(motor_line),
-                       "id=%u ack 0xA1 mode=0x%02X (%s)\r\n",
-                       (unsigned int)motor_ids[i], motor_enable_ack[i].mode,
-                       Motor_ModeName(motor_enable_ack[i].mode));
-        Uart7_Print(motor_line);
-
-        enabled_ok++;
-      }
-    }
-
-    /* 每台都回了 0xA1 就点下一个颜色；否则保持当前颜色，再按一次重来 */
-    if (enabled_ok == MOTOR_COUNT)
-    {
-      WS2812_SetColor(Motor_LedNextColor());
-
-      uint8_t led_r = 0U;
-      uint8_t led_g = 0U;
-      uint8_t led_b = 0U;
-      WS2812_GetOutput(&led_r, &led_g, &led_b);
-
-      (void)snprintf(motor_line, sizeof(motor_line),
-                     "enable OK. LED -> next color (%u,%u,%u), brightness=%u.\r\n",
-                     (unsigned int)led_r, (unsigned int)led_g, (unsigned int)led_b,
-                     (unsigned int)WS2812_GetBrightness());
-      Uart7_Print(motor_line);
-
-      /* ---- ① 版本号（0xFD -> 0xFE）：使能成功之后只查一次 ---- */
-      for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
-      {
-        MotorVersion version;
-        uint8_t ver_ok = Motor_QueryVersion(motor_ids[i], &version);
-
-        /* 没收到也把 10 字节原样打出来：全 0 = 一个字节都没收到 */
-        (void)snprintf(motor_line, sizeof(motor_line),
-                       "id=%u version query (0xFD): reply=%s, rx="
-                       "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-                       (unsigned int)motor_ids[i], (ver_ok != 0U) ? "OK" : "NONE",
-                       version.raw[0], version.raw[1], version.raw[2], version.raw[3],
-                       version.raw[4], version.raw[5], version.raw[6], version.raw[7],
-                       version.raw[8], version.raw[9]);
-        Uart7_Print(motor_line);
-
-        if (ver_ok != 0U)
-        {
-          /* 年字节是 20XX 的 XX（2021 年 = 0x15 = 十进制 21），所以按十进制打 */
-          (void)snprintf(motor_line, sizeof(motor_line),
-                         "id=%u version: date=20%02u-%02u-%02u, model=0x%02X, fw=0x%02X, hw=0x%02X\r\n",
-                         (unsigned int)motor_ids[i],
-                         (unsigned int)version.year, (unsigned int)version.month,
-                         (unsigned int)version.day, (unsigned int)version.model,
-                         (unsigned int)version.fw_version, (unsigned int)version.hw_version);
-          Uart7_Print(motor_line);
-        }
-      }
-
-      /* ---- ② 之后一直循环查里程/位置/故障码（0x74 -> 0x75），全部打在 UART7 ---- */
-      Uart7_Print("enter status loop (0x74: mileage/position/fault) ...\r\n");
-
-      while (1)
-      {
-        for (uint8_t i = 0U; i < MOTOR_COUNT; i++)
-        {
-          MotorStatus status;
-          char fault_text[48];
-          uint8_t st_ok = Motor_QueryStatus(motor_ids[i], &status);
-
-          Motor_FaultText(status.fault, fault_text, sizeof(fault_text));
-
-          /* 位置原始值 0~32767 对应 0~360°，要角度自己换算（x * 360 / 32767） */
-          (void)snprintf(motor_line, sizeof(motor_line),
-                         "id=%u status (0x74): reply=%s, mileage=%ld, position=%u, "
-                         "fault=0x%02X (%s), rx="
-                         "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-                         (unsigned int)motor_ids[i], (st_ok != 0U) ? "OK" : "NONE",
-                         (long)status.mileage, (unsigned int)status.position,
-                         (unsigned int)status.fault, fault_text,
-                         status.raw[0], status.raw[1], status.raw[2], status.raw[3],
-                         status.raw[4], status.raw[5], status.raw[6], status.raw[7],
-                         status.raw[8], status.raw[9]);
-          Uart7_Print(motor_line);
-        }
-
-        /* 每查完一轮换一个灯色 = 轮询心跳（也顺带确认主循环还活着） */
-        WS2812_SetColor(Motor_LedNextColor());
-
-        HAL_Delay(MOTOR_STATUS_POLL_MS);
-      }
-    }
-#endif /* 旧主循环 */
 
 #if 0 /* BMI088 的数据本轮先不发，要放开时把这里改回 #if 1，
          同时把 USER CODE 2 / USER CODE 0 里对应的 #if 0 一起打开。 */

@@ -57,19 +57,16 @@
 /* ---- 后台采样任务的周期 ---- */
 #define POWER_MON_PERIOD_MS       1000U
 
-/* ---- 电池串数（算“单片电压”用）----
-   不管接的是电池还是开关电源，统一按“N 串电池”建模，只有一个旋钮：
-     6 = 6S 锂聚合物（现场那套；满 25.2 V，单片 3.30 V 以下算空 ⇒ 19.8 V 告警）
-     3 = 12 V 那套（开关电源也能这么算：12.0 V ⇒ 4.00 V/片，落在窗口中间，不会误报；
-         真正的窗口是 9.9–12.75 V，对一个“12 V 电源 / 3S 电池”是合理的）
-   发 `ctrl cells N` 改（快捷写法见 tools/ota.py：ctrl 6s / 3s / 12v）。
-   只存在 RAM 里，复位后回到默认值。
+/* ---- 电池串数（算“单片电压”用）：按总压自动判定 ----
+   现场只有两种电源，而且量程**完全不重合**，所以不需要人去设，看总压就能认定：
+     6S 锂聚合物电池：单片窗口 3.30~4.25 V ⇒ 整组 19.8~25.5 V
+     12 V 开关电源（当 3S 算）：        ⇒ 9.9~12.75 V
+   分界取 16 V：低于它按 3 串（12 V 那套），高于/等于它按 6 串。
    ⚠ 没有“不判单片”这种特殊值：有特例就会多出一堆 cells==0 的分支，
      换算/告警/显示就不是同一条路了。 */
-#define POWER_MON_DEFAULT_CELLS   6U      /* 默认 6S（现场那套是电池，优先保护它） */
-#define POWER_MON_CELLS_MIN       1U      /* 至少按 1 串算（防止除零） */
-#define POWER_MON_CELLS_MAX       8U      /* 最多按 8 串算：8S 满电 33.6 V 已经贴近 36.3 V 量程上限，
-                                             再往上报（9~12S）永远只能报低压，没意义 */
+#define POWER_MON_CELLS_SWITCH_MV 16000U  /* 分界：< 16 V 按 3 串，>= 16 V 按 6 串 */
+#define POWER_MON_CELLS_LOW       3U      /* 12 V 开关电源（当 3S 算） */
+#define POWER_MON_CELLS_HIGH      6U      /* 6S 电池 */
 #define POWER_MON_LOW_CELL_MV     3300U   /* 单片低于 3.30 V ⇒ 低压告警 */
 #define POWER_MON_HIGH_CELL_MV    4250U   /* 单片高于 4.25 V ⇒ 过压告警（按 N 串算） */
 
@@ -108,11 +105,7 @@ void PowerMon_Format(char *out, uint32_t out_size, uint32_t mv);
 
 /* ---- 电池串数 / 单片电压 / 告警 ---- */
 
-/* 设置电池串数（1..POWER_MON_CELLS_MAX，越界会被夹到范围内）。
-   任意任务里都能调（一个字节的读写是原子的），并会当场按新串数重判一次告警。 */
-void PowerMon_SetCells(uint8_t cells);
-
-/* 当前电池串数（总有值：1..POWER_MON_CELLS_MAX） */
+/* 当前电池串数（按总压自动判定：6S 电池 = 6、12 V 那套 = 3。总有值，不会返回 0） */
 uint8_t PowerMon_GetCells(void);
 
 /* 单片电压 mV（还没采到值时返回 0） */

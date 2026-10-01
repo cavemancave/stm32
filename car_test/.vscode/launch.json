@@ -1,0 +1,18 @@
+{
+    "configurations": [
+        {
+            "name": "ota_boot",
+            "type": "stlinkgdbtarget",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+            "runEntry": "main",
+            "imagesAndSymbols": [
+                {
+                    "imageFileName": "${workspaceFolder}/build/Debug/motor_boot.elf"
+                }
+            ],
+            "verbose": false
+        }
+    ]
+}
