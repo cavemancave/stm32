@@ -1023,7 +1023,7 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg,
        否则跟随循环下一拍就把电机拽回目标位置，急停 / 失能会“按不住”；
        而**指名 leader（2 号机）** 的命令不停跟随 —— 那正是“自己驱动遥控端”那条路子。 */
     if ((MotorFollow_IsRunning() != 0U) &&
-        (cmd != OTA_CTRL_FOLLOW) && (cmd != OTA_CTRL_SPIN) &&
+        (cmd != OTA_CTRL_FOLLOW) && (cmd != OTA_CTRL_SPIN) && (cmd != OTA_CTRL_LEAD) &&
         ((motor_index == 0U) || (motor_index == MOTOR_FOLLOW_FOLLOWER_INDEX)))
     {
         UartLog_Print("motor: follow stopped by a manual command\r\n");
@@ -1150,6 +1150,14 @@ uint8_t MotorCtrl_RemoteCmd(uint8_t motor_index, uint8_t cmd, uint32_t arg,
             if (out2 != NULL)
             {
                 *out2 = MotorCtrl_MotorIdOfIndex(MOTOR_FOLLOW_LEADER_INDEX);
+            }
+            break;
+
+        case OTA_CTRL_LEAD:
+            /* 速度前馈提前量（ms）：跟随时直接调，无需重启。回复 data = 生效值 */
+            if (out != NULL)
+            {
+                *out = MotorFollow_SetLead(arg);
             }
             break;
 

@@ -96,6 +96,16 @@
 #define FOLLOW_READ_RETRY         10U
 #define FOLLOW_READ_RETRY_MS      200U
 
+/* ---- “等停稳”的判据（切模式之后用）--------------------------------------
+   切进位置环的一瞬间，电机内部的“给定值”寄存器里可能还是**上一次**留下的数字
+   （以前测试发过的 8191 / 0 之类），它会朝那个老目标猛冲。实测冲掉过将近一圈
+   （-32608 计数），方向由“最短路径”决定，往前也行往后也行。
+   所以切完模式要等它真的停下来，再重新取基准。 */
+#define FOLLOW_SETTLE_POLL_MS      100U
+#define FOLLOW_SETTLE_TIMEOUT_MS   3000U
+#define FOLLOW_SETTLE_STILL_COUNTS 60     /* 约 0.66°，小于它就算“没动” */
+#define FOLLOW_SETTLE_SAMPLES      3U
+
 /* Private variables ---------------------------------------------------------*/
 
 static osThreadId_t    s_task = NULL;
@@ -119,16 +129,32 @@ static uint8_t  s_leader_id   = 0U;   /* 启动时由 MotorCtrl_MotorIdOfIndex()
 static uint8_t  s_follower_id = 0U;
 static uint32_t s_period_ms   = MOTOR_FOLLOW_PERIOD_DEFAULT_MS;
 
-/* ---- leader 自动转动（spin）---- */
-static uint32_t s_spin         = 0U;   /* 单位 0.1°/s，0 = 不自动转 */
-static uint32_t s_spin_phase   = 0U;   /* 步进的小数累加器（不足 1 个计数的那部分） */
-static uint32_t s_spin_last_ms = 0U;   /* 上一次推目标的时间戳（算 dt） */
-static int64_t  s_leader_target;       /* 斜坡推到的"绝对目标计数" */
+/* ---- leader 自动转动（spin）----
+   斜坡**不是自己累加一个目标**（那样目标会越跑越远：leader 跟不上的时候
+   ——比如超过它位置环的速度上限——误差会无限增长，一直顶在最大力矩上），
+   而是每拍按"它当前在哪 + 速度前馈提前量"重算目标，见 MotorFollow_Step。
+   ⚠⚠ 那个"它当前在哪"必须与 s_traveled 用**同一个原点**（= ctrl follow 那一刻的
+     leader 位置，见 s_leader_base_pos）。曾经把"切模式后重新读到的位置"当原点，
+     两边差了一段（那次是 -1310 计数）⇒ 每拍目标都恒定偏低 ⇒ 电机一路**倒转**，
+     而且比命令速度还快（实测命令 +30°/s 跑成 -60°/s）。
+   所以这里只需要记转速和那个基准。 */
+static uint32_t s_spin      = 0U;   /* 单位 0.1°/s，0 = 不自动转 */
+static uint16_t s_leader_base_pos = 0U;  /* leader 在 ctrl follow 那一刻的位置（s_traveled 的原点） */
 
-/* ---- 跟随的基准 / 状态 ---- */
-static int64_t  s_leader_last   = 0;   /* 上一拍 leader 的绝对计数 */
-static int64_t  s_traveled      = 0;   /* leader 累计走了多少计数（相对起始） */
-static int64_t  s_follower_base = 0;   /* follower 起始绝对计数 */
+/* ---- 速度前馈 ---- */
+static uint32_t s_lead_ms         = MOTOR_FOLLOW_LEAD_DEFAULT_MS;
+static int32_t  s_leader_speed_cps = 0;   /* leader 实测速度（计数/s，一阶滤波后的） */
+
+/* ---- 跟随的基准 / 状态 ----
+   ⚠ 这里全部用**位置值(0..32767) + 最短路径增量**来跟踪角度，**刻意不用里程字段**
+     （理由见 MotorFollow_ShortestDiff 的注释：里程在过零点附近不可靠）。 */
+static uint16_t s_leader_last_pos   = 0U;   /* 上一拍 leader 的位置值 */
+static uint16_t s_follower_last_pos = 0U;   /* 上一拍 follower 的位置值 */
+static uint16_t s_follower_base_pos = 0U;   /* follower 的起始位置（目标 = 它 + 增量） */
+static int64_t  s_traveled          = 0;    /* leader 累计走了多少计数（最短路径累加） */
+static int64_t  s_follower_moved    = 0;    /* follower 累计走了多少计数（同理，算 lag 用） */
+static uint32_t s_prev_ms           = 0U;   /* 上一拍的时刻（算实测速度用） */
+static uint32_t s_step_dt_ms        = 1U;   /* 本拍用了多久（ms） */
 static uint8_t  s_have_last     = 0U;  /* 0 = 还没对齐基准（第一拍只对齐，不动作） */
 static uint8_t  s_miss_streak   = 0U;  /* 连续没答上的拍数 */
 static uint8_t  s_lag_warned    = 0U;  /* 本轮是否已经警告过"落后太多" */
@@ -143,13 +169,14 @@ static uint32_t s_win_ticks  = 0U;     /* 窗口内跑了几拍 */
 static int64_t  s_err_sum    = 0;
 static int32_t  s_err_max    = 0;
 static uint32_t s_err_n      = 0U;
+static uint32_t s_tick_max_ms = 0U;    /* 本统计窗口内最慢的一拍（ms） */
 
 /* Private function prototypes -----------------------------------------------*/
 static void    MotorFollow_Task(void *argument);
 static void    MotorFollow_Step(void);
 static void    MotorFollow_Abort(const char *why);
 static void    MotorFollow_Report(void);
-static uint8_t MotorFollow_ReadAbs(uint8_t motor_id, int64_t *abs_out,
+static uint8_t MotorFollow_ReadPos(uint8_t motor_id, uint16_t *pos_out,
                                    uint32_t retry, uint32_t retry_ms);
 
 /* Private functions ---------------------------------------------------------*/
@@ -198,11 +225,40 @@ static uint16_t MotorFollow_Wrap(int64_t abs_counts)
 }
 
 /*
- * 读一台电机的"绝对计数"（里程 × 一圈 + 位置）。
- * retry/retry_ms 用于启动阶段（电机刚上电要过一会儿才应答）。
- * 返回 1 = 成功且 *abs_out 已填好。
+ * 两个位置值之间"实际走了多少计数"：位置值一圈是 0~32767，而且 0 和 32767
+ * 是同一个点，所以要按**最短路径**算，范围 -16384..+16384。
+ *
+ * ⚠⚠ **不要用"里程"字段做角度展开**（本模块最初就是这么写的，被坑了很多）：
+ *   实测里程并不可靠 —— 位置刚过零点时它还没 +1，于是 `里程×32768 + 位置`
+ *   会突然**掉一整圈**（实测 -32614 计数）。后果：跟随循环以为 leader 瞬移了一
+ *   整圈 ⇒ 要么当 glitch 把这一拍丢掉（follower 停下来不动），要么把目标一下子
+ *   跳一整圈（follower 追不上 ⇒ 被判成失控急停）。
+ *   按最短路径累加位置增量就没这个问题，而且是**自纠正**的：过零点只是 +1。
+ * ⚠ 前提：**一拍转不超过 180°**。本工程一拍 ~24 ms、电机最快 400 rpm（2400°/s）
+ *   ⇒ 一拍最多 57°，安全（而且 leader 的转速上限也远低于这个）。
  */
-static uint8_t MotorFollow_ReadAbs(uint8_t motor_id, int64_t *abs_out,
+static int32_t MotorFollow_ShortestDiff(uint16_t from, uint16_t to)
+{
+    int32_t d = (int32_t)to - (int32_t)from;
+
+    if (d > (int32_t)(FOLLOW_COUNTS_PER_TURN / 2))
+    {
+        d -= (int32_t)FOLLOW_COUNTS_PER_TURN;
+    }
+    else if (d < -(int32_t)(FOLLOW_COUNTS_PER_TURN / 2))
+    {
+        d += (int32_t)FOLLOW_COUNTS_PER_TURN;
+    }
+
+    return d;
+}
+
+/*
+ * 读一台电机的**原始位置值**（0x74 的 position，一圈 0~32767）。
+ * retry/retry_ms 用于启动阶段（电机刚上电要过一会儿才应答）。
+ * 返回 1 = 成功且 *pos_out 已填好。
+ */
+static uint8_t MotorFollow_ReadPos(uint8_t motor_id, uint16_t *pos_out,
                                    uint32_t retry, uint32_t retry_ms)
 {
     MotorStatus status;
@@ -211,10 +267,9 @@ static uint8_t MotorFollow_ReadAbs(uint8_t motor_id, int64_t *abs_out,
     {
         if (Motor_QueryStatus(motor_id, &status) != 0U)
         {
-            if (abs_out != NULL)
+            if (pos_out != NULL)
             {
-                *abs_out = ((int64_t)status.mileage * FOLLOW_COUNTS_PER_TURN) +
-                           (int64_t)status.position;
+                *pos_out = status.position;
             }
 
             return 1U;
@@ -230,6 +285,55 @@ static uint8_t MotorFollow_ReadAbs(uint8_t motor_id, int64_t *abs_out,
 }
 
 /*
+ * 等一台电机停稳，返回停稳后的**原始位置值**（等不到就返回最后一次读到的值）。
+ *
+ * 为什么非等不可：**切进位置环的那一瞬间，电机可能朝一个陈旧的目标猛冲**
+ * （理由见上面 FOLLOW_SETTLE_* 的注释）。不等就往下走会有两个后果，都不好：
+ *   - 这段冲刺被当成"leader 走了多少"算进增量里 ⇒ follower 跟着猛甩一圈；
+ *   - 或者被 glitch 保护整段丢掉 ⇒ follower 停在原地，看上去"完全没跟随"
+ *     （实测就是被这个坑过：用户看到 2 号机猛转、1 号机一动不动）。
+ * 等它停稳、以"停稳后的位置"重新起算，这段冲刺就与跟随无关了。
+ */
+static uint16_t MotorFollow_WaitSettled(uint8_t motor_id, uint16_t fallback,
+                                        uint32_t timeout_ms)
+{
+    uint16_t last   = fallback;
+    uint16_t cur    = fallback;
+    uint8_t  have   = 0U;
+    uint8_t  still  = 0U;
+    uint32_t waited = 0U;
+
+    while (waited < timeout_ms)
+    {
+        osDelay(FOLLOW_SETTLE_POLL_MS);
+        waited += FOLLOW_SETTLE_POLL_MS;
+
+        if (MotorFollow_ReadPos(motor_id, &cur, 1U, 0U) == 0U)
+        {
+            continue;   /* 丢一帧不算，接着等 */
+        }
+
+        if (have != 0U)
+        {
+            int32_t  d  = MotorFollow_ShortestDiff(last, cur);
+            uint32_t ad = (d < 0) ? (uint32_t)(-d) : (uint32_t)d;
+
+            still = (ad <= FOLLOW_SETTLE_STILL_COUNTS) ? (uint8_t)(still + 1U) : 0U;
+        }
+
+        last = cur;
+        have = 1U;
+
+        if (still >= FOLLOW_SETTLE_SAMPLES)
+        {
+            break;      /* 停稳了 */
+        }
+    }
+
+    return cur;
+}
+
+/*
  * 一拍：leader（可选驱动）→ 读 leader → 写 follower → 读 follower → 统计。
  * ⚠ 函数第一句就是检查 s_run：Stop() 把 s_run 清零后**任何**一拍都必须立刻返回，
  *   不能再去碰总线 —— 否则 Stop() 发的"急停"会被我们后面这一拍覆盖掉。
@@ -239,9 +343,10 @@ static void MotorFollow_Step(void)
     MotorStatus   st;
     MotorValueAck ack;
     uint32_t      now;
-    int64_t       leader_abs;
-    int64_t       follower_abs;
-    int64_t       delta;
+    uint16_t      leader_pos;
+    uint16_t      follower_pos;
+    int32_t       delta;
+    int64_t       follower_target;
     int64_t       lag;
 
     if (s_run == 0U)
@@ -251,51 +356,15 @@ static void MotorFollow_Step(void)
 
     now = osKernelGetTickCount();
 
-    /* ---- 1) leader 自动驱动：自己算目标、一小步一小步推过去 ---- */
-    if (s_spin != 0U)
+    /* 本拍用了多久（算 leader 实测速度用）。同一毫秒里跑了两拍时按 1 ms 算 */
     {
-        uint32_t dt_ms = MotorFollow_TicksToMs(now - s_spin_last_ms);
+        uint32_t dt = MotorFollow_TicksToMs(now - s_prev_ms);
 
-        if (dt_ms == 0U)
-        {
-            dt_ms = 1U;     /* 同一毫秒里跑了两拍（tick 粒度），按 1 ms 算 */
-        }
-        s_spin_last_ms = now;
-
-        /* 本拍该走多少计数：
-             转速(0.1°/s) → °/s（÷10）→ 计数/s（× 32768 / 360）→ 本拍（× dt/1000）
-             = 转速 × dt × 32768 / 3600000
-           不足 1 个计数的部分留在 s_spin_phase 里，攒够了下一次补上
-           （慢速时才不会"每拍都进位到 0、一直不动"）。
-           ⚠ 整个乘积走 uint64：转速上限 36000 × dt 最多 1000 ms 时是 1.2e12，
-             直接塞回 uint32_t 会截断，那一拍就会吐一个完全错误的步长。 */
-        uint64_t phase = (uint64_t)s_spin_phase +
-                         ((uint64_t)s_spin * (uint64_t)dt_ms * 32768ULL);
-        int32_t  step  = (int32_t)(phase / 3600000ULL);
-
-        s_spin_phase = (uint32_t)(phase % 3600000ULL);
-
-        if (step > (int32_t)FOLLOW_SPIN_MAX_STEP)
-        {
-            step = (int32_t)FOLLOW_SPIN_MAX_STEP;
-        }
-
-        s_leader_target += step;
-
-        if (Motor_SetValue(s_leader_id, (int16_t)MotorFollow_Wrap(s_leader_target),
-                           0U, 0U, &ack) == 0U)
-        {
-            s_stats.miss_leader++;      /* leader 拖不动了：下一拍读位置也会失败，会走中止 */
-        }
+        s_step_dt_ms = (dt == 0U) ? 1U : dt;
+        s_prev_ms    = now;
     }
 
-    if (s_run == 0U)
-    {
-        return;
-    }
-
-    /* ---- 2) 读 leader 的实测位置（跟随的"源"） ---- */
-    if (Motor_QueryStatus(s_leader_id, &st) == 0U)
+    /* ---- 1) 读 leader 的实测位置（跟随的"源"） ---- */    if (Motor_QueryStatus(s_leader_id, &st) == 0U)
     {
         s_stats.miss_leader++;
         s_miss_streak++;
@@ -320,24 +389,26 @@ static void MotorFollow_Step(void)
         UartLog_Print(line);
     }
 
-    leader_abs = ((int64_t)st.mileage * FOLLOW_COUNTS_PER_TURN) + (int64_t)st.position;
+    leader_pos = st.position;
 
-    /* ---- 3) 增量 + 突变保护 ---- */
+    /* ---- 3) 增量：按最短路径累加（过零点只是 +1，不会跳一整圈） ---- */
     if (s_have_last == 0U)
     {
         /* 第一拍只对齐基准（Start 里已经读过一次，这里兜个底） */
-        s_leader_last = leader_abs;
-        s_have_last   = 1U;
+        s_leader_last_pos = leader_pos;
+        s_have_last       = 1U;
         return;
     }
 
-    delta = leader_abs - s_leader_last;
+    delta = MotorFollow_ShortestDiff(s_leader_last_pos, leader_pos);
 
-    if ((delta > FOLLOW_GLITCH_COUNTS) || (delta < -FOLLOW_GLITCH_COUNTS))
+    /* 一拍跳 > 90°：电机最快 2400°/s，24 ms 也就 57° ⇒ 这只能是丢帧/总线错，
+       不是真运动。丢掉这一拍、重新对齐位置，**不动 follower**。 */
+    if ((delta > (int32_t)FOLLOW_GLITCH_COUNTS) || (delta < -(int32_t)FOLLOW_GLITCH_COUNTS))
     {
         char line[128];
 
-        s_leader_last = leader_abs;     /* 只重新对齐基准，**不动 follower** */
+        s_leader_last_pos = leader_pos;
         s_stats.glitch++;
 
         if (s_stats.glitch <= 3U)
@@ -352,17 +423,71 @@ static void MotorFollow_Step(void)
         return;
     }
 
-    s_leader_last = leader_abs;
-    s_traveled += delta;
+    s_leader_last_pos = leader_pos;
+    s_traveled += (int64_t)delta;
+
+    /* leader 实测速度（计数/s），一阶滤波（时间常数 ~8 拍）：
+       瞬时增量本身有 ±几个计数的抖动，直接乘提前量会把目标抖出十几度。 */
+    {
+        int32_t inst = (int32_t)(((int64_t)delta * 1000) / (int64_t)s_step_dt_ms);
+
+        s_leader_speed_cps += (inst - s_leader_speed_cps) / 8;
+    }
 
     if (s_run == 0U)
     {
         return;
     }
 
-    /* ---- 4) 给 follower 发目标：它的起始位置 + leader 走过的增量 ---- */
-    if (Motor_SetValue(s_follower_id,
-                       (int16_t)MotorFollow_Wrap(s_follower_base + s_traveled),
+    /* ---- 3) leader 自动驱动 ----
+       目标 = 斜坡起点 + **它实测走了多少** + 命令速度的前馈提前量
+       ⚠ 目标必须按**实测位置**重算，不能自己累加：自己累加的话，leader 跟不上的时候
+         （比如超过它位置环 ~45°/s 的速度上限）目标会越跑越远、一直顶在最大力矩上
+         —— 直驱台架就是被这个拖动的。按实测重算会自动退化成"按它的能力跑"。 */
+    if (s_spin != 0U)
+    {
+        int64_t cmd_cps = ((int64_t)s_spin * FOLLOW_COUNTS_PER_TURN) / 3600;  /* 0.1°/s → 计数/s */
+        int64_t lead    = (cmd_cps * (int64_t)s_lead_ms) / 1000;
+        int64_t target;
+
+        if (lead > (int64_t)MOTOR_FOLLOW_LEAD_MAX_COUNTS)
+        {
+            lead = (int64_t)MOTOR_FOLLOW_LEAD_MAX_COUNTS;
+        }
+
+        target = (int64_t)s_leader_base_pos + s_traveled + lead;
+
+        if (Motor_SetValue(s_leader_id, (int16_t)MotorFollow_Wrap(target),
+                           0U, 0U, &ack) == 0U)
+        {
+            s_stats.miss_leader++;
+        }
+    }
+
+    if (s_run == 0U)
+    {
+        return;
+    }
+
+    /* ---- 4) 给 follower 发目标：它的起始位置 + leader 走的增量 + 速度前馈
+       （前馈量取的是 **leader 实测速度**，所以在手拖模式下也适用；
+        leader 停下来时实测速度归零、前馈自动归零，不会一直偏着） ---- */
+    {
+        int64_t lead = ((int64_t)s_leader_speed_cps * (int64_t)s_lead_ms) / 1000;
+
+        if (lead > (int64_t)MOTOR_FOLLOW_LEAD_MAX_COUNTS)
+        {
+            lead = (int64_t)MOTOR_FOLLOW_LEAD_MAX_COUNTS;
+        }
+        else if (lead < -(int64_t)MOTOR_FOLLOW_LEAD_MAX_COUNTS)
+        {
+            lead = -(int64_t)MOTOR_FOLLOW_LEAD_MAX_COUNTS;
+        }
+
+        follower_target = (int64_t)s_follower_base_pos + s_traveled + lead;
+    }
+
+    if (Motor_SetValue(s_follower_id, (int16_t)MotorFollow_Wrap(follower_target),
                        0U, 0U, &ack) == 0U)
     {
         s_stats.miss_follower++;
@@ -403,12 +528,14 @@ static void MotorFollow_Step(void)
         UartLog_Print(line);
     }
 
-    follower_abs = ((int64_t)st.mileage * FOLLOW_COUNTS_PER_TURN) + (int64_t)st.position;
+    follower_pos = st.position;
+    s_follower_moved += (int64_t)MotorFollow_ShortestDiff(s_follower_last_pos, follower_pos);
+    s_follower_last_pos = follower_pos;
 
-    /* 跟随误差 = 命令它到的地方 - 它实际在的地方（正 = 落在目标后面，没跟上）
-       等价于"两台电机的角度差"：leader 走了 s_traveled，follower 只走了
-       follower_abs - s_follower_base，差值就是落后的角度 */
-    lag = s_traveled - (follower_abs - s_follower_base);
+    /* 跟随误差 = 命令它走了多少 - 它实际走了多少（正 = 落在目标后面，没跟上）
+       两边都是各自"最短路径累加"的位移，所以不需要标定零点偏置，
+       它就是**两台电机当前的角度差**（1 号机落后 2 号机多少）。 */
+    lag = s_traveled - s_follower_moved;
 
     s_err_sum += lag;
     s_err_n++;
@@ -451,6 +578,15 @@ static void MotorFollow_Step(void)
     }
 
     /* ---- 6) 计时 / 统计窗口 ---- */
+    {
+        uint32_t tick_ms = MotorFollow_TicksToMs(osKernelGetTickCount() - now);
+
+        if (tick_ms > s_tick_max_ms)
+        {
+            s_tick_max_ms = tick_ms;    /* 最慢的一拍（总线被人抢 / 电机不答） */
+        }
+    }
+
     s_stats.ticks++;
     s_win_ticks++;
 
@@ -487,10 +623,15 @@ static void MotorFollow_Report(void)
     char     line2[FOLLOW_LINE_SIZE];
     char     e1[16];
     char     e2[16];
+    char     sp[16];
     uint32_t now      = osKernelGetTickCount();
     uint32_t win_ms   = MotorFollow_TicksToMs(now - s_window_ms);
     uint32_t rate_10  = 0U;    /* 频率 ×10（“48.5Hz”要打小数，就不在 printf 里算） */
+    int32_t  speed_01 = MotorFollow_CountsToDeciDeg((int64_t)s_leader_speed_cps);  /* 实测速度（0.1°/s） */
     int64_t  rev_100  = (s_traveled * 100) / FOLLOW_COUNTS_PER_TURN;   /* 圈数 ×100 */
+    int64_t  rev_abs  = (rev_100 < 0) ? -rev_100 : rev_100;            /* 负数分开打，
+                                    否则 -7 会打成 "0.-7rev"（整数取模带符号） */
+    const char *rev_sign = (rev_100 < 0) ? "-" : "";
     uint32_t hwm      = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
 
     /* 实测周期：窗口总时长 ÷ 窗口里的拍数 */
@@ -516,22 +657,26 @@ static void MotorFollow_Report(void)
 
     MotorFollow_DeciText(MotorFollow_CountsToDeciDeg(s_stats.err_avg_counts), e1, sizeof(e1));
     MotorFollow_DeciText(MotorFollow_CountsToDeciDeg(s_stats.err_max_counts), e2, sizeof(e2));
+    MotorFollow_DeciText(speed_01, sp, sizeof(sp));
 
     /* 两行：一行进度/总线，一行跟随质量（长行拆两行是这边的约定） */
     (void)snprintf(line, sizeof(line),
-                   "[follow] t=%lus rate=%lu.%luHz travel=%ld.%02ldrev "
+                   "[follow] t=%lus rate=%lu.%luHz tmax=%lums travel=%s%ld.%02ldrev "
                    "miss=%lu/%lu glitch=%lu overrun=%lu hwm=%lu\r\n",
                    (unsigned long)s_stats.seconds,
                    (unsigned long)(rate_10 / 10U), (unsigned long)(rate_10 % 10U),
-                   (long)(rev_100 / 100), (long)(rev_100 % 100),
+                   (unsigned long)s_tick_max_ms,
+                   rev_sign, (long)(rev_abs / 100), (long)(rev_abs % 100),
                    (unsigned long)s_stats.miss_leader, (unsigned long)s_stats.miss_follower,
                    (unsigned long)s_stats.glitch, (unsigned long)s_stats.overrun,
                    (unsigned long)hwm);
     UartLog_Print(line);
 
     (void)snprintf(line2, sizeof(line2),
-                   "[follow]   lag avg=%s max=%s deg (leader id%u -> follower id%u)\r\n",
-                   e1, e2, (unsigned int)s_leader_id, (unsigned int)s_follower_id);
+                   "[follow]   lag avg=%s max=%s deg, leader %s deg/s, lead=%lums "
+                   "(id%u -> id%u)\r\n",
+                   e1, e2, sp, (unsigned long)s_lead_ms,
+                   (unsigned int)s_leader_id, (unsigned int)s_follower_id);
     UartLog_Print(line2);
 
     /* 开新窗口 */
@@ -541,6 +686,7 @@ static void MotorFollow_Report(void)
     s_err_max   = 0;
     s_err_n     = 0U;
     s_lag_warned = 0U;
+    s_tick_max_ms = 0U;
 }
 
 /*
@@ -627,10 +773,9 @@ uint8_t MotorFollow_Init(void)
 uint8_t MotorFollow_Start(uint32_t period_ms)
 {
     char     line[FOLLOW_LINE_SIZE];
-    int64_t  leader_abs   = 0;
-    int64_t  follower_abs = 0;
+    uint16_t leader_pos   = 0U;
+    uint16_t follower_pos = 0U;
     uint8_t  already      = (s_run != 0U) ? 1U : 0U;
-    uint32_t now          = osKernelGetTickCount();
     uint32_t period_req   = period_ms;
 
     /* 周期：给得比下限还小 = "没给参数"，用默认值，不夹到 5 ms
@@ -668,7 +813,7 @@ uint8_t MotorFollow_Start(uint32_t period_ms)
 
     s_period_ms = period_req;
     s_spin      = 0U;       /* 每次开始都从"不自动转"起（要自动转再发 spin） */
-    s_spin_phase = 0U;
+    s_leader_speed_cps = 0;
 
     UartLog_Print("[follow] start: enable + position loop, then track leader position\r\n");
 
@@ -683,8 +828,8 @@ uint8_t MotorFollow_Start(uint32_t period_ms)
         return 0U;
     }
 
-    /* 基准：两台各自的绝对计数。leader 这里只是"读"，它是什么模式都不影响 */
-    if (MotorFollow_ReadAbs(s_leader_id, &leader_abs,
+    /* 基准：两台各自的位置值。leader 这里只是"读"，它是什么模式都不影响 */
+    if (MotorFollow_ReadPos(s_leader_id, &leader_pos,
                             FOLLOW_READ_RETRY, FOLLOW_READ_RETRY_MS) == 0U)
     {
         UartLog_Print("[follow] start FAILED: leader not answering (0x74)\r\n");
@@ -692,23 +837,44 @@ uint8_t MotorFollow_Start(uint32_t period_ms)
         return 0U;
     }
 
-    if (MotorFollow_ReadAbs(s_follower_id, &follower_abs, 3U, 100U) == 0U)
+    if (MotorFollow_ReadPos(s_follower_id, &follower_pos, 3U, 100U) == 0U)
     {
         UartLog_Print("[follow] start FAILED: follower not answering (0x74)\r\n");
         MotorCtrl_SafeStopAll();
         return 0U;
     }
 
-    s_leader_last      = leader_abs;
-    s_leader_target    = leader_abs;      /* spin 的斜坡从"现在的位置"起跑 */
-    s_follower_base    = follower_abs;
-    s_traveled         = 0;
-    s_have_last        = 1U;
-    s_miss_streak      = 0U;
-    s_lag_warned       = 0U;
+    /* 切进位置环那一瞬间它可能朝老目标冲过一段（见 FOLLOW_SETTLE_* 注释）：
+       等它停稳，拿"停稳后的位置"当基准 —— 否则那段冲刺会被当成"它该在的位置
+       偏了"，一开始就带一个大 lag。 */
+    {
+        uint16_t settled = MotorFollow_WaitSettled(s_follower_id, follower_pos,
+                                                   FOLLOW_SETTLE_TIMEOUT_MS);
+
+        if (settled != follower_pos)
+        {
+            (void)snprintf(line, sizeof(line),
+                           "[follow] follower settled at %u (moved %d counts when "
+                           "entering position loop)\r\n",
+                           (unsigned int)settled,
+                           (int)MotorFollow_ShortestDiff(follower_pos, settled));
+            UartLog_Print(line);
+        }
+
+        follower_pos = settled;
+    }
+
+    s_leader_last_pos   = leader_pos;
+    s_leader_base_pos   = leader_pos;            /* s_traveled 的原点 = 现在这个位置 */
+    s_follower_base_pos = follower_pos;
+    s_follower_last_pos = follower_pos;
+    s_traveled          = 0;
+    s_follower_moved    = 0;
+    s_have_last         = 1U;
+    s_miss_streak       = 0U;
+    s_lag_warned        = 0U;
     s_last_leader_fault   = 0U;
     s_last_follower_fault = 0U;
-    s_spin_last_ms     = now;
 
     /* 统计清零 */
     s_stats.running        = 1U;
@@ -728,12 +894,17 @@ uint8_t MotorFollow_Start(uint32_t period_ms)
     s_stats.glitch         = 0U;
     s_stats.overrun        = 0U;
 
-    s_start_ms  = now;
-    s_window_ms = now;
+    /* ⚠ 统计窗口的起点要取“**现在**”，不能用函数开头那个时间戳：
+       Start 里要等使能重试、还要等停稳，可能花好几秒，用旧时间戳会让第一秒的
+       rate 看起来很离谱（实测 0.4 Hz —— 其实只是把准备时间也算进去了）。 */
+    s_start_ms  = osKernelGetTickCount();
+    s_window_ms = s_start_ms;
+    s_prev_ms   = s_start_ms;
     s_win_ticks = 0U;
     s_err_sum   = 0;
     s_err_max   = 0;
     s_err_n     = 0U;
+    s_tick_max_ms = 0U;
 
     /* 200 ms 状态轮询要停掉：它也在这条总线上，跟着一起抢只会让两边都变慢 */
     MotorCtrl_PollPause(1U);
@@ -742,10 +913,10 @@ uint8_t MotorFollow_Start(uint32_t period_ms)
     (void)osSemaphoreRelease(s_sem);
 
     (void)snprintf(line, sizeof(line),
-                   "[follow] follower id%u -> position loop OK, leader id%u base=%ld, "
+                   "[follow] follower id%u -> position loop OK, leader id%u pos=%u, "
                    "period=%lu ms\r\n",
                    (unsigned int)s_follower_id,
-                   (unsigned int)s_leader_id, (long)leader_abs,
+                   (unsigned int)s_leader_id, (unsigned int)leader_pos,
                    (unsigned long)s_period_ms);
     UartLog_Print(line);
     UartLog_Print("[follow]   numbers every 1 s; `ctrl spin <0.1deg/s>` to auto-spin"
@@ -798,9 +969,9 @@ uint8_t MotorFollow_IsRunning(void)
 
 uint8_t MotorFollow_SetSpin(uint32_t tenth_degps)
 {
-    char    line[FOLLOW_LINE_SIZE];
-    int64_t leader_abs = 0;
-    uint8_t mode;
+    char     line[FOLLOW_LINE_SIZE];
+    uint16_t leader_pos = 0U;
+    uint8_t  mode;
 
     if (tenth_degps > MOTOR_FOLLOW_SPIN_MAX)
     {
@@ -809,11 +980,22 @@ uint8_t MotorFollow_SetSpin(uint32_t tenth_degps)
 
     if (tenth_degps == 0U)
     {
-        /* 停 = 斜坡不再往前推，目标冻结 ⇒ 位置环让它就地停住 */
         if (s_spin != 0U)
         {
+            uint16_t pos = 0U;
+
             s_spin = 0U;
-            UartLog_Print("[follow] spin stopped (target frozen, leader holds)\r\n");
+
+            /* ⚠ 把 leader **按在它现在的位置**上：斜坡目标里带着前馈提前量
+               （可能十几度），不重新按一下它就会继续朝那个提前量爬过去，停不干净。 */
+            if (MotorFollow_ReadPos(s_leader_id, &pos, 1U, 0U) != 0U)
+            {
+                MotorValueAck ack;
+
+                (void)Motor_SetValue(s_leader_id, (int16_t)pos, 0U, 0U, &ack);
+            }
+
+            UartLog_Print("[follow] spin stopped (leader held at its current position)\r\n");
         }
 
         return 1U;
@@ -845,7 +1027,7 @@ uint8_t MotorFollow_SetSpin(uint32_t tenth_degps)
         }
     }
 
-    if (MotorFollow_ReadAbs(s_leader_id, &leader_abs, 3U, 100U) == 0U)
+    if (MotorFollow_ReadPos(s_leader_id, &leader_pos, 3U, 100U) == 0U)
     {
         UartLog_Print("[follow] spin FAILED: leader not answering (0x74)\r\n");
         return 0U;
@@ -857,23 +1039,53 @@ uint8_t MotorFollow_SetSpin(uint32_t tenth_degps)
     {
         MotorValueAck ack;
 
-        (void)Motor_SetValue(s_leader_id, (int16_t)MotorFollow_Wrap(leader_abs),
+        (void)Motor_SetValue(s_leader_id, (int16_t)MotorFollow_Wrap(leader_pos),
                              0U, 0U, &ack);
     }
 
-    s_leader_target = leader_abs;
-    s_leader_last   = leader_abs;      /* 基准也对齐，免得下一拍算出一个假的巨量增量 */
-    s_have_last     = 1U;
-    s_spin_phase    = 0U;
-    s_spin_last_ms  = osKernelGetTickCount();
-    s_spin          = tenth_degps;
+    /* ⚠⚠ 关键：上面那一下只是"叫它别冲了"，**它可能还在冲的半路上**（实测能冲
+       掉将近一圈）。等它真的停下来，再重新读一次位置、重新按一下，以那个位置
+       作为斜坡的起点。
+       不等的话就会出两种很难查的现象（都实测碰到过）：
+         - 冲刺被算进"leader 走了多少" ⇒ follower 跟着猛甩一圈；
+         - 冲刺被 glitch 保护丢掉 ⇒ follower 停在原地，看上去"完全没跟随"。 */
+    {
+        uint16_t settled = MotorFollow_WaitSettled(s_leader_id, leader_pos,
+                                                   FOLLOW_SETTLE_TIMEOUT_MS);
+        MotorValueAck ack;
+
+        if (settled != leader_pos)
+        {
+            (void)snprintf(line, sizeof(line),
+                           "[follow] spin: leader settled at %u (moved %d counts "
+                           "when entering position loop)\r\n",
+                           (unsigned int)settled,
+                           (int)MotorFollow_ShortestDiff(leader_pos, settled));
+            UartLog_Print(line);
+        }
+
+        leader_pos = settled;
+
+        /* 再按一次：停稳后的位置才是斜坡真正的起点 */
+        (void)Motor_SetValue(s_leader_id, (int16_t)MotorFollow_Wrap(leader_pos),
+                             0U, 0U, &ack);
+    }
+
+    /* ⚠ 这里**不要**动 s_leader_last_pos / s_traveled 的原点：
+       切模式那一下的位移（实测 -933~-2515 计数）要老老实实计进 s_traveled，
+       follower 才会把它一起镜像过去（两根轴就等于一直耦合着的）。
+       重设原点的话，目标会恒定偏一段 —— 那就是反向跑飞的原因。 */
+    s_have_last         = 1U;
+    s_leader_speed_cps  = 0;
+    s_prev_ms           = osKernelGetTickCount();
+    s_spin              = tenth_degps;
 
     (void)snprintf(line, sizeof(line),
                    "[follow] spin: leader id%u -> %lu.%lu deg/s (position-loop ramp), "
-                   "target=%ld\r\n",
+                   "target=%u\r\n",
                    (unsigned int)s_leader_id,
                    (unsigned long)(tenth_degps / 10U), (unsigned long)(tenth_degps % 10U),
-                   (long)leader_abs);
+                   (unsigned int)leader_pos);
     UartLog_Print(line);
 
     return 1U;
@@ -882,6 +1094,30 @@ uint8_t MotorFollow_SetSpin(uint32_t tenth_degps)
 uint32_t MotorFollow_GetSpin(void)
 {
     return s_spin;
+}
+
+uint32_t MotorFollow_SetLead(uint32_t ms)
+{
+    char line[FOLLOW_LINE_SIZE];
+
+    if (ms > MOTOR_FOLLOW_LEAD_MAX_MS)
+    {
+        ms = MOTOR_FOLLOW_LEAD_MAX_MS;
+    }
+
+    s_lead_ms = ms;
+
+    (void)snprintf(line, sizeof(line),
+                   "[follow] lead -> %lu ms (0 = pure follow, ~500 cancels the lag)\r\n",
+                   (unsigned long)s_lead_ms);
+    UartLog_Print(line);
+
+    return s_lead_ms;
+}
+
+uint32_t MotorFollow_GetLead(void)
+{
+    return s_lead_ms;
 }
 
 void MotorFollow_GetStats(MotorFollowStats *out)
@@ -894,4 +1130,5 @@ void MotorFollow_GetStats(MotorFollowStats *out)
     *out = s_stats;
     out->running = (s_run != 0U) ? 1U : 0U;
     out->spin    = s_spin;
+    out->lead_ms = s_lead_ms;
 }

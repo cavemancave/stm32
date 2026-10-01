@@ -91,6 +91,7 @@ CTRL = {
     "follow": 0x0B,       # 位置跟随（2 号机→1 号机）：--arg 0=停，其它=周期 ms（默认 20）
     "spin": 0x0C,         # 让 2 号机自动匀速转：--arg 转速，单位 0.1°/s（0=停）
     "stacks": 0x0D,       # 打印每个任务的栈余量（明细在设备日志里，会自动回显）
+    "lead": 0x0E,         # 跟随的速度前馈提前量（ms，0=纯跟随；~500 抵消稳态滞后）
 }
 
 # 带固定参数的快捷命令：名字 → (cmd, arg)。想手动指定就再加 --arg。
@@ -666,9 +667,11 @@ def cmd_ctrl(dev: Device, args):
         extra = (f"  已按 {cells}S 算（单片窗口 {cells * 3.30:.2f}~{cells * 4.25:.2f}V）")
     elif cmd == 0x0B:                   # 跟随命令：data = 1 在跑，data2 = 实测周期 µs，data3 = 平均误差
         extra = f"  跟随={'运行中' if data else '已停止'}"
-        if data and data2:
+        # ⚠ 周期/误差在"停止"的那条回帧里同样有效（是上次运行的统计），
+        #   所以**不要**写成 `if data and data2` —— 那样停止时就看不到总账了
+        if data2:
             extra += f"  实测周期={data2 / 1000.0:.2f}ms（{1000000.0 / data2:.1f}Hz）"
-        if data and data3:
+        if data3:
             extra += f"  平均落后={i32(rsp, 9) * 360.0 / 32768:+.1f}°"
         extra += "  （实时数字看设备日志的 [follow] 行）"
     elif cmd == 0x0C:                   # spin：data = 生效转速（0.1°/s），data2 = leader 总线 ID
@@ -676,6 +679,8 @@ def cmd_ctrl(dev: Device, args):
                  else "  2 号机已停（就地保持）")
     elif cmd == 0x0D:                   # 栈余量：明细行已经随文本口回显在上面了
         extra = "  逐任务栈余量见上面 [stack] 行"
+    elif cmd == 0x0E:                   # 前馈提前量：data = 生效值（ms）
+        extra = (f"  提前量={data}ms" + ("（纯跟随）" if data == 0 else ""))
     print(f"{args.cmd}({arg}){who} → {ST_TEXT.get(rsp[0], rsp[0])}  data={data}{extra}")
 
 

@@ -26,15 +26,37 @@
 #define MOTOR_FOLLOW_LEADER_INDEX     2U     /* 遥控端 */
 #define MOTOR_FOLLOW_FOLLOWER_INDEX   1U     /* 被控端 */
 
-/* 跟随周期（ms）。默认 20 ms（≈50 Hz）：一拍 4 条帧 ≈ 12~16 ms，留一点余量。
+/* 跟随周期（ms）。默认 25 ms：一拍要跑 4 条帧（驱动 leader + 读 leader + 写 follower
+   + 读 follower），**实测一拍 24 ms 上下**（≈42 Hz）—— 周期给到 20 ms 反而会"每拍都
+   算超时"（日志里 overrun 会一直涨，那个计数就没意义了）。
    `ctrl follow <n>` 的 n 小于下限时按**默认值**处理（= 没给参数），大于上限就夹到上限。 */
-#define MOTOR_FOLLOW_PERIOD_DEFAULT_MS  20U
+#define MOTOR_FOLLOW_PERIOD_DEFAULT_MS  25U
 #define MOTOR_FOLLOW_PERIOD_MIN_MS      5U
 #define MOTOR_FOLLOW_PERIOD_MAX_MS      200U
 
 /* leader 自动转速的上限（单位 0.1°/s）：36000 = 3600°/s。
-   只是防手滑（电机无负载也就 400 rpm = 2400°/s），不是性能指标。 */
+   ⚠⚠ **但实测这个电机在位置环里的速度上限只有 ~45°/s**（≈450）：
+     2026-09-20 实测：命令 90°/s 时它只跑到 42°/s（是一直顶在最大速度上），
+     而且之前 4×90° 那轮里每步 ~1.7~2 s = 45~53°/s —— 同一个上限。
+     顶在最大速度上 = 反作用力矩最大，**直驱台架会被拖着动**，所以建议给 30°/s（300）以内；
+     这个宏只是防手滑，不要拿它当“能力”。 */
 #define MOTOR_FOLLOW_SPIN_MAX           36000U
+
+/* ---- 速度前馈（“提前量”）----------------------------------------------
+   位置环在**匀速运动**下有一个正比于速度的稳态跟随误差（实测 42°/s 时 22°），
+   把它折成时间就是等效延迟：22° ÷ 42°/s = **约 0.5 s**。也就是它的“刚度”
+   Kp ≈ 2 /s：要让电机跑某速度，目标就得领先它 速度×0.5 s 那一点。
+   所以给目标加一个提前量就能把这个稳态误差基本压掉：
+     目标 = 实测位置 + 速度 × 提前量
+   - 提前量 = 0 = 纯跟随（原来的行为，会稳定落后一截）；
+   - 提前量取到实测的那个等效延迟（~500 ms）时，稳态滞后基本为 0；
+   - 再大就会过冲/抖（相当于把相位提前过头），要调就小幅调。
+   ⚠ 它只能抵消**稳态**（匀速）那一部分；速度突变时的瞬态滞后消不掉 —— 那是位置环带宽。 */
+#define MOTOR_FOLLOW_LEAD_DEFAULT_MS    500U
+#define MOTOR_FOLLOW_LEAD_MAX_MS        2000U
+
+/* 提前量本身的上限（计数，8192 = 90°）：防止手拖一下高频拉出个巨大的目标跳变 */
+#define MOTOR_FOLLOW_LEAD_MAX_COUNTS    8192
 
 /* 统计快照：1 Hz 的日志和无线命令的回帧都用它 */
 typedef struct
@@ -48,6 +70,7 @@ typedef struct
     uint32_t ticks;            /* 本次一共跑了几拍 */
     uint32_t seconds;          /* 本次一共跑了多少秒 */
     uint32_t spin;             /* leader 当前自动转速（0.1°/s），0 = 没在自动转 */
+    uint32_t lead_ms;          /* 速度前馈提前量（ms），0 = 纯跟随 */
     int32_t  travel_counts;    /* leader 累计走过的计数（32768 = 一圈） */
     int32_t  err_avg_counts;   /* 最近一个统计窗口的平均跟随误差（计数，带符号） */
     int32_t  err_max_counts;   /* 最近一个统计窗口的最大跟随误差（按绝对值取，带符号） */
@@ -84,6 +107,11 @@ uint8_t MotorFollow_SetSpin(uint32_t tenth_degps);
 
 /* 当前 leader 自动转速（0.1°/s），0 = 没在自动转 */
 uint32_t MotorFollow_GetSpin(void);
+
+/* 速度前馈提前量（ms）。0 = 纯跟随；默认见 MOTOR_FOLLOW_LEAD_DEFAULT_MS。
+   只改一个数，不用重启跟随。返回生效后的值。 */
+uint32_t MotorFollow_SetLead(uint32_t ms);
+uint32_t MotorFollow_GetLead(void);
 
 /* 取统计快照（out 可以为 NULL）。原子性不保证"整块一致"，只是给日志/回帧看个大概。 */
 void MotorFollow_GetStats(MotorFollowStats *out);
