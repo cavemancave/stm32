@@ -1,0 +1,250 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : freertos.c
+  * Description        : Code for freertos applications
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
+#include "FreeRTOS.h"
+#include "cmsis_os2.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include "usart.h"
+#include "motor_io.h"
+#include "motor_ctrl.h"
+#include "power_mon.h"
+#include "uart_log.h"
+#include "ota_com.h"
+#include "ota_service.h"
+#include "ota_trace.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+typedef StaticTimer_t osStaticTimerDef_t;
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN Variables */
+
+/* USER CODE END Variables */
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for motor_task */
+osThreadId_t motor_taskHandle;
+const osThreadAttr_t motor_task_attributes = {
+  .name = "motor_task",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for motorPos */
+osTimerId_t motorPosHandle;
+osStaticTimerDef_t motorPosControlBlock;
+const osTimerAttr_t motorPos_attributes = {
+  .name = "motorPos",
+  .cb_mem = &motorPosControlBlock,
+  .cb_size = sizeof(motorPosControlBlock),
+};
+
+/* Private function prototypes -----------------------------------------------*/
+/* USER CODE BEGIN FunctionPrototypes */
+/* 启动路标：把“走到哪一步”和“还剩多少 FreeRTOS 堆”一起打出来（只在 Debug 构建里真的输出） */
+static void ota_boot_mark(const char *tag);
+/* USER CODE END FunctionPrototypes */
+
+void StartDefaultTask(void *argument);
+void MotorTask(void *argument);
+void motorPosCallback(void *argument);
+
+void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
+
+  /* 无线口 USART1（PA9/PA10）：日志 + 控制帧 + OTA 三合一。
+     先起串口，再把它挂成日志主口，最后才建 otaSvc 任务。
+     ⚠ 每一步都打一个路标 + 剩余 FreeRTOS 堆：这几个 osXxxNew 全都从 FreeRTOS 堆里分配，
+       堆不够时表现就是“卡在这里一声不吭”，有堆数字才能一眼看出来。 */
+  OtaCom_Init(OTA_PORT_BAUD);
+  ota_boot_mark("H1: USART1 up");
+
+  /* 日志口：主口 = 无线口 USART1；板上有线的 UART7 顺便镜像一份（不接线也不影响）。
+     不想要镜像就把 UartLog_AddSink(&huart7) 这行删掉。 */
+  UartLog_Init(OtaCom_Handle());
+  UartLog_AddSink(&huart7);
+  ota_boot_mark("H2: log ready (mutex)");
+
+  /* OTA 服务：建 otaSvc 任务（收帧/收固件），里面还会装 ota_host 的钩子 */
+  OtaService_Init();
+  ota_boot_mark("H3: otaSvc task");
+
+  /* 电机串口（USART10 + 请求队列） */
+  MotorIo_Init(&huart10);
+  ota_boot_mark("H4: motor io (queue)");
+
+  /* 电源电压监测（PC4/ADC1_INP4）：开一个 1 Hz 的后台采样任务。
+     ADC 本体和自校准在 main() 里已经做过了（MX_ADC1_Init / PowerMon_Init），
+     这里只是把定时采样跑起来，并把第一次读数打进日志（此时 UartLog 已就绪）。 */
+  PowerMon_Start();
+  ota_boot_mark("H5: power monitor");
+
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* Create the timer(s) */
+  /* creation of motorPos */
+  motorPosHandle = osTimerNew(motorPosCallback, osTimerPeriodic, NULL, &motorPos_attributes);
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* 状态轮询定时器：周期到了只释放信号量（回调在 timer service task 里跑，
+     绝对不能阻塞），真正的收发由 MotorCtrl_PollTask 做。 */
+  (void)osTimerStart(motorPosHandle, pdMS_TO_TICKS(MOTOR_CTRL_POLL_MS));
+  ota_boot_mark("I1: poll timer started");
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* ⚠ 请求队列不在这里：它是收发层的东西，在 Device/Motor/motor_io.c 里随串口一起建
+     （MotorIo_Init）。所以 CubeMX 的 FreeRTOS 配置里也不需要再配 motorQueue 了，
+     别再加回来。（这段原来写在文件上部、不在 USER CODE 区里，被 Generate Code
+     删过一次，现在挪进 USER CODE 区。） */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* creation of motor_task */
+  motor_taskHandle = osThreadNew(MotorTask, NULL, &motor_task_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* 轮询信号量 + 轮询任务（CubeMX 的线程列表里没有它，所以在这里建） */
+  MotorCtrl_Init();
+
+  ota_boot_mark("I2: all threads created -> start scheduler");
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+}
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN StartDefaultTask */
+  /* 主控制流程：使能 → 切位置环 → 0 点 / 3 点来回（不返回） */
+  MotorCtrl_Task(argument);
+
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartDefaultTask */
+}
+
+/* USER CODE BEGIN Header_MotorTask */
+/**
+* @brief Function implementing the motor_task thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_MotorTask */
+void MotorTask(void *argument)
+{
+  /* USER CODE BEGIN MotorTask */
+  /* 独占 USART10 的收发任务：从队列取请求 → 收发 → 通知发起者（不返回） */
+  MotorIo_Task(argument);
+
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END MotorTask */
+}
+
+/* motorPosCallback function */
+void motorPosCallback(void *argument)
+{
+  /* USER CODE BEGIN motorPosCallback */
+  /* 只释放信号量，不阻塞（这里跑在 timer service task 里） */
+  MotorCtrl_OnPollTimer();
+  /* USER CODE END motorPosCallback */
+}
+
+/* Private application code --------------------------------------------------*/
+/* USER CODE BEGIN Application */
+
+/* 启动路标（Debug 构建里真的输出；Release 里整块被优化掉） */
+static void ota_boot_mark(const char *tag)
+{
+#if defined(DEBUG)
+  char line[96];
+
+  (void)snprintf(line, sizeof(line), "[app] %s [free heap=%lu]\r\n",
+                 tag, (unsigned long)xPortGetFreeHeapSize());
+  OtaTrace_Text(line);
+#else
+  (void)tag;
+#endif
+}
+
+/* USER CODE END Application */
+
