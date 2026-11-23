@@ -145,7 +145,7 @@ static void app_send_heartbeat(uint32_t now_ms)
     msg.len = APP_FRAME_MAX_PAYLOAD;
     wr_u32le(&msg.payload[0], (uint32_t)(now_ms - s_boot_ms));
     wr_u16le(&msg.payload[4], sat_u16(s_stats.valid_frames));
-    wr_u16le(&msg.payload[6], sat_u16(s_stats.tx_frames));
+    wr_u16le(&msg.payload[6], sat_u16(uart_dma_rx_error_count()));
     (void)app_send_msg(&msg);
 }
 

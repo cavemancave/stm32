@@ -1,11 +1,18 @@
 /**
  * @file    uart_dma_rx.c
- * @brief   UART RX DMA 循环接收 + 半满/全满中断搬运到环形缓冲。
+ * @brief   UART RX DMA 循环接收 + IDLE/HT/TC 事件搬运到环形缓冲。
  *
- * 为什么 DMA 缓冲必须放 .dma_buffer：
- *   STM32H7 的 DMA1/DMA2 不能访问 DTCM（0x2000_0000），而本工程的 .bss
- *   默认链接到 DTCM。DMA 缓冲放到 RAM_D2（0x3000_0000）的 .dma_buffer 段，
- *   由链接脚本单独放置；软件 ring 仍在 DTCM，CPU 访问更快。
+ * 为什么不用"半满/全满中断搬一半"：
+ *   请求-应答式的小帧（8~16 字节）要等 DMA 攒满 512 字节才会进 ring，
+ *   单帧会在 DMA 缓冲里躺很久，表现为"收不到"。
+ *   这里改用 HAL_UARTEx_ReceiveToIdle_DMA：
+ *     - 一帧结束、线路空闲 -> IDLE 事件，立刻把新字节搬进 ring；
+ *     - 连续粘包/高速流 -> HT/TC 事件每 512 字节搬一次；
+ *   两条路径都走 HAL_UARTEx_RxEventCallback，Size 是 DMA 缓冲内的位置。
+ *
+ * DMA 缓冲必须放 .dma_buffer（RAM_D2）：
+ *   STM32H7 的 DMA1/DMA2 不能访问 DTCM，而 .bss 默认在 DTCM。
+ *   见 STM32H723xG_flash.ld。
  */
 #include "uart_dma_rx.h"
 #include "app_config.h"
@@ -17,8 +24,8 @@ static uint8_t s_dma_buf[APP_RX_DMA_BUF_SIZE]
 typedef struct {
     UART_HandleTypeDef *huart;
     ringbuf_t *ring;
-    volatile uint32_t half_events;
-    volatile uint32_t full_events;
+    uint16_t last_pos;
+    volatile uint32_t rx_events;
     volatile uint32_t error_count;
     volatile uint32_t last_error;
     volatile bool started;
@@ -26,45 +33,58 @@ typedef struct {
 
 static uart_dma_rx_ctx_t s_ctx;
 
-static void rx_half_done(void)
+/* 把 DMA 缓冲中 [last_pos, pos) 的新字节搬进 ring；pos 可以等于 size（回绕点）。 */
+static void rx_copy_to(uint16_t pos)
 {
-    s_ctx.half_events++;
-    (void)ringbuf_write(s_ctx.ring, s_dma_buf, (uint16_t)(APP_RX_DMA_BUF_SIZE / 2U));
-}
+    uint16_t last = s_ctx.last_pos;
+    uint16_t size = (uint16_t)APP_RX_DMA_BUF_SIZE;
 
-static void rx_full_done(void)
-{
-    s_ctx.full_events++;
-    (void)ringbuf_write(s_ctx.ring,
-                        &s_dma_buf[APP_RX_DMA_BUF_SIZE / 2U],
-                        (uint16_t)(APP_RX_DMA_BUF_SIZE / 2U));
+    if (pos > size) {
+        pos = size;
+    }
+    if (pos == size) {
+        if (last < size) {
+            (void)ringbuf_write(s_ctx.ring, &s_dma_buf[last], (uint16_t)(size - last));
+        }
+        s_ctx.last_pos = 0U;
+        return;
+    }
+
+    if (pos >= last) {
+        if (pos > last) {
+            (void)ringbuf_write(s_ctx.ring, &s_dma_buf[last], (uint16_t)(pos - last));
+        }
+    } else {
+        if (last < size) {
+            (void)ringbuf_write(s_ctx.ring, &s_dma_buf[last], (uint16_t)(size - last));
+        }
+        if (pos > 0U) {
+            (void)ringbuf_write(s_ctx.ring, &s_dma_buf[0], pos);
+        }
+    }
+    s_ctx.last_pos = pos;
 }
 
 bool uart_dma_rx_start(UART_HandleTypeDef *huart, ringbuf_t *ring)
 {
     s_ctx.huart = huart;
     s_ctx.ring = ring;
-    s_ctx.half_events = 0U;
-    s_ctx.full_events = 0U;
+    s_ctx.last_pos = 0U;
+    s_ctx.rx_events = 0U;
     s_ctx.error_count = 0U;
     s_ctx.last_error = 0U;
     s_ctx.started = false;
 
-    if (HAL_UART_Receive_DMA(huart, s_dma_buf, (uint16_t)sizeof(s_dma_buf)) != HAL_OK) {
+    if (HAL_UARTEx_ReceiveToIdle_DMA(huart, s_dma_buf, (uint16_t)sizeof(s_dma_buf)) != HAL_OK) {
         return false;
     }
     s_ctx.started = true;
     return true;
 }
 
-uint32_t uart_dma_rx_half_events(void)
+uint32_t uart_dma_rx_events(void)
 {
-    return s_ctx.half_events;
-}
-
-uint32_t uart_dma_rx_full_events(void)
-{
-    return s_ctx.full_events;
+    return s_ctx.rx_events;
 }
 
 uint32_t uart_dma_rx_error_count(void)
@@ -79,17 +99,11 @@ uint32_t uart_dma_rx_last_error(void)
 
 /* ---- HAL 回调（覆盖 weak 定义） ------------------------------------------ */
 
-void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart)
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if ((s_ctx.started) && (huart == s_ctx.huart)) {
-        rx_half_done();
-    }
-}
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if ((s_ctx.started) && (huart == s_ctx.huart)) {
-        rx_full_done();
+        s_ctx.rx_events++;
+        rx_copy_to(Size);
     }
 }
 
@@ -102,7 +116,8 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         /* ORE/FE/NE 等错误会让 HAL 停掉 RX DMA；如果已经回到 READY，重启。
          * 非致命错误（例如 PE）HAL 仍保持 BUSY_RX，此时不能重复启动。 */
         if (huart->RxState == HAL_UART_STATE_READY) {
-            (void)HAL_UART_Receive_DMA(huart, s_dma_buf, (uint16_t)sizeof(s_dma_buf));
+            s_ctx.last_pos = 0U;
+            (void)HAL_UARTEx_ReceiveToIdle_DMA(huart, s_dma_buf, (uint16_t)sizeof(s_dma_buf));
         }
     }
 }

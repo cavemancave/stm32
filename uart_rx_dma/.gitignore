@@ -4,3 +4,5 @@ mx.scratch
 # 本地临时实验文件（不属于工程）
 tmp_*
 *.a
+# 测试脚本生成的本机报告
+tools/test_report.json
