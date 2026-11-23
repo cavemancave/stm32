@@ -15,6 +15,7 @@
  *   见 STM32H723xG_flash.ld。
  */
 #include "uart_dma_rx.h"
+#include "uart_tx.h"
 #include "app_config.h"
 
 /* DMA 可见内存：见 STM32H723xG_flash.ld 的 .dma_buffer (RAM_D2)。 */
@@ -113,11 +114,13 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         s_ctx.error_count++;
         s_ctx.last_error = huart->ErrorCode;
 
-        /* ORE/FE/NE 等错误会让 HAL 停掉 RX DMA；如果已经回到 READY，重启。
-         * 非致命错误（例如 PE）HAL 仍保持 BUSY_RX，此时不能重复启动。 */
+        /* RX 侧错误处理 */
         if (huart->RxState == HAL_UART_STATE_READY) {
             s_ctx.last_pos = 0U;
             (void)HAL_UARTEx_ReceiveToIdle_DMA(huart, s_dma_buf, (uint16_t)sizeof(s_dma_buf));
         }
     }
+
+    /* TX DMA 也可能收到错误回调；由 TX 模块判断 gState 后决定是否清 busy。 */
+    uart_tx_on_error(huart);
 }

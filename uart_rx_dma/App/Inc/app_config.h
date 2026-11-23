@@ -35,6 +35,11 @@
 /* 主循环一次最多从环形缓冲取多少字节。取小一点可以让解析/回包更均匀。 */
 #define APP_POLL_CHUNK           64U
 
+/* 发送：软件 FIFO + DMA 暂存区。响应帧最长 16 B，8192 B FIFO 可吸收
+ * 1000 帧突发（约 16 KB 响应里 DMA 持续排空，净积压约 2 KB）。 */
+#define APP_TX_RING_SIZE         8192U
+#define APP_TX_DMA_BUF_SIZE      512U
+
 /* -------------------------------------------------------------------------- */
 /* 帧格式                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -62,6 +67,10 @@
 
 #if (APP_RX_DMA_BUF_SIZE & 1U) != 0U
 #error "APP_RX_DMA_BUF_SIZE must be even"
+#endif
+
+#if (APP_TX_RING_SIZE & (APP_TX_RING_SIZE - 1U)) != 0U
+#error "APP_TX_RING_SIZE must be a power of two"
 #endif
 
 #endif /* APP_CONFIG_H */

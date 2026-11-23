@@ -53,6 +53,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/stats.c
     App/Src/timebase.c
     App/Src/uart_dma_rx.c
+    App/Src/uart_tx.c
 )
 
 # Add include paths

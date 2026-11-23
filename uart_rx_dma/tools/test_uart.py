@@ -325,6 +325,7 @@ def test_stats(link: SerialLink) -> None:
         ("page2", ["timeout_err", "ring_drop_bytes", "uart_err"]),
         ("page3", ["proc_avg_us", "proc_min_us", "proc_max_us"]),
         ("page4", ["tx_frames", "unknown_type_err", "payload_len_err"]),
+        ("page5", ["tx_drop_bytes", "tx_err", "tx_pending"]),
     ]
     for page, (label, names) in enumerate(labels):
         st = query_stats(link, page)
@@ -370,7 +371,7 @@ def test_perf(link: SerialLink, count: int, baud: int) -> PerfResult:
     result = PerfResult()
     link.drain()
 
-    before = {p: query_stats(link, p) for p in (0, 1, 2)}
+    before = {p: query_stats(link, p) for p in (0, 1, 2, 5)}
     result.stats_before = {p: (s.values if s else None) for p, s in before.items()}
 
     # 先测顺序 RTT（30 次），避免和批量吞吐混在一起
@@ -457,10 +458,10 @@ def test_perf(link: SerialLink, count: int, baud: int) -> PerfResult:
 
     check(got == count, f"批量 {count} 帧全部收到响应（实际 {got}）")
 
-    after = {p: query_stats(link, p) for p in (0, 1, 2)}
+    after = {p: query_stats(link, p) for p in (0, 1, 2, 5)}
     result.stats_after = {p: (s.values if s else None) for p, s in after.items()}
 
-    if all(before[p] and after[p] for p in (0, 1, 2)):
+    if all(before[p] and after[p] for p in (0, 1, 2, 5)):
         dv = after[0].values[0] - before[0].values[0]
         dcrc = after[1].values[0] - before[1].values[0]
         dlen = after[1].values[1] - before[1].values[1]
@@ -468,6 +469,8 @@ def test_perf(link: SerialLink, count: int, baud: int) -> PerfResult:
         dtimeout = after[2].values[0] - before[2].values[0]
         dring = after[2].values[1] - before[2].values[1]
         duart = after[2].values[2] - before[2].values[2]
+        dtxdrop = after[5].values[0] - before[5].values[0]
+        dtxerr = after[5].values[1] - before[5].values[1]
         check(dv >= got, f"valid_frames 增量 {dv} >= {got}")
         check(dcrc == 0, f"crc_err 增量 {dcrc} (期望 0)")
         check(dlen == 0, f"len_err 增量 {dlen} (期望 0)")
@@ -475,6 +478,8 @@ def test_perf(link: SerialLink, count: int, baud: int) -> PerfResult:
         check(dtimeout == 0, f"timeout_err 增量 {dtimeout} (期望 0)")
         check(dring == 0, f"ring_drop_bytes 增量 {dring} (期望 0)")
         check(duart == 0, f"uart_err 增量 {duart} (期望 0)")
+        check(dtxdrop == 0, f"tx_drop_bytes 增量 {dtxdrop} (期望 0)")
+        check(dtxerr == 0, f"tx_err 增量 {dtxerr} (期望 0)")
 
     print()
     print("         结果                值")

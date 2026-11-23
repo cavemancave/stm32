@@ -8,9 +8,11 @@
  *   2: timeout_err, ring_drop_bytes, uart_err
  *   3: proc_avg_us, proc_min_us, proc_max_us
  *   4: tx_frames, unknown_type_err, payload_len_err
+ *   5: tx_drop_bytes, tx_err, tx_pending
  */
 #include "stats.h"
 #include "messages.h"
+#include "uart_tx.h"
 #include "bytes.h"
 
 void stats_init(stats_t *s)
@@ -125,6 +127,11 @@ bool stats_build_page(const stats_t *s, uint8_t page, uint8_t out[APP_FRAME_MAX_
         v0 = s->tx_frames;
         v1 = s->unknown_type_err;
         v2 = s->payload_len_err;
+        break;
+    case 5U:
+        v0 = uart_tx_dropped_bytes();
+        v1 = uart_tx_error_count();
+        v2 = uart_tx_pending();
         break;
     default:
         return false;

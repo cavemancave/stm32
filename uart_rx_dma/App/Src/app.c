@@ -7,6 +7,7 @@
 #include "ringbuf.h"
 #include "frame_parser.h"
 #include "uart_dma_rx.h"
+#include "uart_tx.h"
 #include "protocol.h"
 #include "stats.h"
 #include "timebase.h"
@@ -36,13 +37,15 @@ static bool app_send_msg(const proto_msg_t *msg)
     uint8_t buf[APP_FRAME_MAX_SIZE];
     uint8_t n = proto_encode(msg->type, msg->payload, msg->len, buf);
     if (n == 0U) {
+        s_stats.tx_err++;
         return false;
     }
-    if (HAL_UART_Transmit(&huart1, buf, n, 100U) != HAL_OK) {
+    if (!uart_tx_write(buf, n)) {
         s_stats.tx_err++;
         return false;
     }
     s_stats.tx_frames++;
+    uart_tx_poll();
     return true;
 }
 
@@ -168,6 +171,8 @@ void app_init(void)
     s_last_uart_report_ms = 0U;
     s_last_heartbeat_ms = HAL_GetTick();
 
+    uart_tx_init(&huart1);
+
     if (!uart_dma_rx_start(&huart1, &s_ring)) {
         Error_Handler();
     }
@@ -196,4 +201,7 @@ void app_poll(void)
         s_last_heartbeat_ms = now_ms;
         app_send_heartbeat(now_ms);
     }
+
+    /* 解析/心跳可能往 TX FIFO 里放了新帧，这里推动 DMA 继续发。 */
+    uart_tx_poll();
 }

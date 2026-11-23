@@ -41,7 +41,7 @@ void stats_note_valid(stats_t *s, uint8_t type);
 void stats_note_parse_error(stats_t *s, uint8_t code);
 void stats_note_proc(stats_t *s, uint32_t us);
 
-/* page 0..4；成功写入 8 字节 payload 返回 true，未知页返回 false。 */
+/* page 0..5；成功写入 8 字节 payload 返回 true，未知页返回 false。 */
 bool stats_build_page(const stats_t *s, uint8_t page, uint8_t out[APP_FRAME_MAX_PAYLOAD]);
 
 #endif /* STATS_H */
