@@ -30,15 +30,16 @@ DMA 缓冲（RAM_D2，DMA 可访问）
 | --- | --- |
 | 板子 | STM32H723VGT6 / DM-MC-Board02 |
 | 串口 | **USART1：PA9 = TX，PA10 = RX** |
-| 波特率 | **921600 8N1**（`APP_UART_BAUD` 可改） |
+| 波特率 | **115200 8N1**（CubeMX 里配置） |
 | USB-TTL | CH343，Windows 上枚举为 **COM12** |
 | 调试器 | ST-Link V2，SWD（PA13/PA14） |
 | 固件 | `build/Debug/motor_control.elf` |
-| Python 测试 | **64/64 检查通过** |
-| 1000 帧压力测试 | **4661.0 帧/s，TX 70.8%，RX 80.9%，RTT 0.55 ms，固件处理 2.0 µs，0 丢帧/0 溢出** |
+| Python 测试 | **66/66 检查通过** |
+| 1000 帧压力测试 | **681.9 帧/s，TX 82.9%，RX 94.7%，RTT 2.62 ms，固件处理 ≈2 µs，0 丢帧/0 溢出** |
 
 > RTT 是电脑侧测的，包含 CH343/USB 驱动和 Python 线程调度；固件内部
-> 处理时间只有 **1–4 µs**（DWT 周期计数器实测）。
+> 处理时间通常约 **2 µs**（DWT 周期计数器实测，偶发到十几 µs 是测量窗口里
+> 进了 UART/DMA 中断）。
 
 ---
 
@@ -53,6 +54,9 @@ DMA 缓冲（RAM_D2，DMA 可访问）
 | GND | 地 | GND（必须共地） |
 
 - 8N1、无硬件流控、3.3 V TTL。USB-TTL 的电平选择跳线请放 **3.3 V**。
+- **外部电源（VCC_IN）必须上电**：只接 ST-Link 的 SWD 时 MCU 可能能跑，
+  但 USART1/USB-TTL 不一定工作。固件用 **PC4/ADC1_INP4** 检测 VCC_IN，
+  测试脚本会主动提示；详见 4.5。
 - **TX/RX 必须交叉**：MCU 的 TX 接 USB-TTL 的 RX，MCU 的 RX 接 USB-TTL 的 TX。
   如果接成 TX-TX / RX-RX，表现是“电脑能收到板子的心跳，但板子收不到电脑的 PING”。
 - 如果收不到任何心跳，按顺序检查：波特率 → PA9/PA10 是否接反 → GND → 固件是否在跑。
@@ -93,9 +97,9 @@ cmake --build build/Debug
 ```powershell
 pip install pyserial
 python tools/test_uart.py --list
-python tools/test_uart.py --port COM12 --baud 921600
-python tools/test_uart.py --port COM12 --baud 921600 --perf-count 1000
-python tools/test_uart.py --port COM12 --baud 921600 --tests perf
+python tools/test_uart.py --port COM12 --baud 115200
+python tools/test_uart.py --port COM12 --baud 115200 --perf-count 1000
+python tools/test_uart.py --port COM12 --baud 115200 --tests perf
 ```
 
 报告写到 `tools/test_report.json`（已加入 `.gitignore`）。
@@ -143,12 +147,14 @@ A5 01 06 01 00 02 00 03 00 20 A2 20 80 5A
 | `CALC_WEIGHTED_REQ` | `0x03` | 电脑→板 | 同上 |
 | `PING_REQ` | `0x10` | 电脑→板 | 无 |
 | `STATS_REQ` | `0x11` | 电脑→板 | 1 B：page（0..4） |
+| `POWER_REQ` | `0x12` | 电脑→板 | 无 |
 | `CALC_SUM_RSP` | `0x81` | 板→电脑 | 8 B：`result int32, proc_us uint16, status uint8, reserved uint8` |
 | `CALC_SQSUM_RSP` | `0x82` | 板→电脑 | 同上 |
 | `CALC_WEIGHTED_RSP` | `0x83` | 板→电脑 | 同上 |
 | `PONG_RSP` | `0x90` | 板→电脑 | 8 B：`uptime_ms uint32, proc_us uint16, valid_frames uint16` |
 | `STATS_RSP` | `0x91` | 板→电脑 | 8 B：`page uint8, flags uint8, v0 uint16, v1 uint16, v2 uint16` |
-| `HEARTBEAT` | `0x7D` | 板→电脑（1 Hz） | 8 B：`uptime_ms uint32, valid_frames uint16, uart_errors uint16` |
+| `POWER_RSP` | `0x92` | 板→电脑 | 8 B：`vcc_mv uint16, pin_mv uint16, present uint8, valid uint8, reserved uint16` |
+| `HEARTBEAT` | `0x7D` | 板→电脑（1 Hz） | 8 B：`uptime_ms uint32, valid_frames uint16, flags uint16`（bit15=外部电源存在，低 15 位=uart_errors） |
 | `READY` | `0x7E` | 板→电脑（上电一次） | 8 B：`version uint16, max_payload uint8, dma_buf uint16, ring_size uint16, timeout_ms uint8` |
 | `NACK` | `0xEE` | 板→电脑 | 8 B：`err_code, type, len, state, raw[4]` |
 
@@ -171,7 +177,7 @@ A5 01 06 01 00 02 00 03 00 20 A2 20 80 5A
 | 1 | `BAD_LEN` | LEN > 8 |
 | 2 | `CRC` | CRC32 不匹配 |
 | 3 | `TAIL` | 帧尾不是 `0x5A` |
-| 4 | `TIMEOUT` | 帧内字节间超时（默认 20 ms） |
+| 4 | `TIMEOUT` | 帧内字节间超时（默认 50 ms） |
 | 5 | `UNKNOWN_TYPE` | 未知消息类型 |
 | 6 | `PAYLOAD_LEN` | payload 长度不符合该消息 |
 | 7 | `RING_OVERFLOW` | 软件环形缓冲溢出 |
@@ -194,6 +200,27 @@ NACK 的 `type/len` 是出错帧的类型/长度，`state` 是解析器出错时
 计数在固件里是 `uint32_t`，上报时饱和到 `uint16_t`，`flags bit0=1` 表示至少
 一个值饱和。
 
+### 4.5 外部电源检测（PC4 / ADC1_INP4）
+
+板子上的 VCC_IN 经 `R86 1 MΩ / R87 100 kΩ` 分压后接 **PC4 = ADC1_INP4**，
+分压比 11:1。固件用 ADC1 采样 PC4，换算：
+
+```
+VCC_IN = PC4_mV × 11
+```
+
+- `POWER_RSP.vcc_mv`：VCC_IN 电压（mV）；
+- `POWER_RSP.pin_mv`：PC4 引脚电压（mV），排查分压电阻/接线时看它；
+- `present`：`vcc_mv >= 3000` 时置 1，表示外部电源已上电；
+- `valid`：ADC 校准/采样成功时为 1。
+
+实测外部 12 V 供电：`VCC_IN = 11.97 V, PC4 = 1.088 V`，`present = 1`。
+
+> 只接 ST-Link 的 SWD 时，MCU 可能由调试器 3.3 V 供电并在跑，但板子的
+> VCC_IN（12 V / 电池）可能没上电，USART1/USB-TTL 不一定工作。测试脚本
+> 启动时会查一次 `POWER_RSP`，没上电就打印醒目提示；心跳的 `flags.bit15`
+> 也带外部电源状态；完全收不到心跳时也会把“外部电源”放在排查清单第一条。
+
 ---
 
 ## 5. 软件结构
@@ -206,6 +233,7 @@ App/
     crc32.h                   CRC-32/ISO-HDLC
     frame_parser.h            帧结构、错误码、解析器状态
     messages.h                消息类型编号
+    power_monitor.h           外部电源检测（PC4/ADC1_INP4）
     protocol.h                编解码/分发接口
     ringbuf.h                 SPSC 环形缓冲
     stats.h                   统计计数
@@ -215,6 +243,7 @@ App/
     app.c                     初始化、主循环、回包、错误上报
     crc32.c                   CRC 实现
     frame_parser.c            状态机
+    power_monitor.c           ADC1_INP4 采样 + VCC_IN 换算
     protocol.c                帧编码、消息分发表、响应/NACK
     ringbuf.c                 SPSC 环形缓冲
     stats.c                   统计页构造
@@ -241,7 +270,8 @@ tools/
 5. 状态机通过 `on_frame` 回调把完整帧交给 `protocol_handle()`。
 6. `protocol_handle()` 查表分发，构造响应或 NACK；`app.c` 用
    `HAL_UART_Transmit()` 发回。
-7. 每 1 s 发一条 `HEARTBEAT`；错误/溢出还会主动发 NACK。
+7. 每 1 s 发一条 `HEARTBEAT`；`power_monitor_poll()` 每 1 s 采一次 VCC_IN；
+   错误/溢出还会主动发 NACK。
 
 ### 5.2 为什么用 IDLE，而不是只用半满/全满中断
 
@@ -330,13 +360,14 @@ ring **8192 B**，`ringbuf_write()` 是“满时丢弃新数据”，绝不覆�
 - 丢弃字节累计在 `dropped`；
 - `app_report_ring_overflow()` 最多 10 Hz 发一条 `NACK_RING_OVERFLOW`；
 - stats page 2 的 `ring_drop_bytes` 可查累计值；
-- 丢字节后残帧由 20 ms 超时或 CRC 错误回收，状态机自动重新同步。
+- 丢字节后残帧由 50 ms 超时或 CRC 错误回收，状态机自动重新同步。
 
-实测边界：
+实测边界（921600 下做过的 4 KB / 8 KB 对比）：
 
 - ring **4096 B** 时，1000 帧一次性突发会丢 **48 B**，并产生 1 次
   `TIMEOUT`（残帧）；1000 帧里收到 996 个响应。
-- 改成 **8192 B** 后，同样 1000 帧：**0 丢字节、0 超时、1000/1000 响应**。
+- 改成 **8192 B** 后，同样 1000 帧：0 丢字节、0 超时、1000/1000 响应。
+- 当前 **115200 + 8192 B** 的 1000 帧实测也是 **0 丢字节、0 超时**。
 
 所以最终选 8192 B。
 
@@ -359,13 +390,46 @@ ring **8192 B**，`ringbuf_write()` 是“满时丢弃新数据”，绝不覆�
 - 要支持无限满速流，需要应用层流控（窗口/ACK）、TX DMA + 发送 ring，
   或降低响应长度。当前测试脚本是发一批、收一批，不会触发这个上限。
 
+### 6.6 波特率降低，缓冲更容易还是更不容易溢出？
+
+分两个缓冲看，结论不一样：
+
+**DMA 缓冲：波特率越低越安全。** 半满 512 B 的时间与波特率成反比：
+
+| 波特率 | 512 B 时间 | 1024 B 时间 |
+| --- | --- | --- |
+| 921600 | 5.56 ms | 11.1 ms |
+| 115200 | 44.4 ms | 88.9 ms |
+
+115200 下 CPU 有 8 倍时间进 HT/TC/IDLE 中断，DMA 缓冲被覆盖的风险明显更低。
+
+**软件 ring：不能简单说“更不容易”，要看比较的是“同样帧数”还是“同样时间”。**
+
+- 请求 14 B、响应 16 B，固件“收一帧→阻塞发一帧”，所以净积压是
+  **每帧 2 B**，这个比例和波特率无关。对于**同样 1000 帧**的满速突发：
+   - 921600：约 2 KB 积压，214 ms 跑完；
+   - 115200：仍然是约 2 KB 积压，但要 1465 ms 才跑完。
+  → ring 的**字节高水位差不多**，只是时间拉长 8 倍。低波特率**不会**把
+  “1000 帧需要 2 KB 缓冲”这件事变成“只需要 256 B”。
+- 如果是**固定墙钟时间**的突发（比如“连续猛发 100 ms”）：
+  115200 只发出 1/8 的字节，积压也只有 1/8，**更不容易溢出**。
+- 如果是**固定字节数的突发**（比如 1000 帧、5000 帧）：
+  积压字节数相同；低波特率给 CPU/中断的时间余量更大，但 ring 的**容量需求**
+  不变。8 KB ring 在 115200 下能吸收约 4096 帧的净积压，在 921600 下也是
+  约 4096 帧；只是 115200 要 5 s 才到，921600 约 0.6 s。
+- 如果是**持续满速、永不节流**：两种波特率最终都会溢出，因为响应比请求长；
+  低波特率只是把“溢出时间”推迟 8 倍，不会改变协议级上限。
+
+一句话：**低波特率让“时间余量”变大、DMA/中断更安全，但不会改变“每帧
+2 B 净积压”的比例；固定帧数突发需要的 ring 字节数基本不变。**
+
 ### 6.4 解析器 / payload 缓冲
 
 - `frame_t.raw[16]`、`payload[8]`；
 - `LEN > 8` 在 `FP_LEN` 状态立即报 `BAD_LEN` 并复位，**不会写 payload**；
 - 最大帧正好 16 B，所有下标有界；
 - CRC 计算长度 `2 + LEN ≤ 10`，有界；
-- 20 ms 帧内超时防止残帧永久占住状态机；
+- 50 ms 帧内超时防止残帧永久占住状态机；
 - 坏 CRC/坏帧尾/坏长度都会复位并重新找 `SOF`。
 
 ### 6.5 UART 硬件溢出
@@ -383,10 +447,11 @@ DMA 一直挂着接收请求，正常不会 ORE。若发生 ORE/FE/NE/PE：
 
 ## 7. Python 测试覆盖
 
-`tools/test_uart.py` 的 64 项检查：
+`tools/test_uart.py` 的 66 项检查：
 
 | # | 场景 | 内容 |
 | --- | --- | --- |
+| 0 | 外部电源 | `POWER_REQ`/`POWER_RSP`，检查 ADC 有效、`VCC_IN >= 3 V` |
 | 1 | 正常 PING | 5 次 PING/PONG，检查 uptime、proc_us、RTT |
 | 2 | 三个计算消息 | 8 组输入（正/负/零/大数饱和），校验结果和 status |
 | 3 | 粘包 | 4 帧一次写、前导垃圾 + 3 帧、单帧拆两次写 |
@@ -399,16 +464,17 @@ DMA 一直挂着接收请求，正常不会 ORE。若发生 ORE/FE/NE/PE：
 实测输出（节选）：
 
 ```
-通过 64/64，失败 0
-性能: 4661.0 帧/s, RTT avg 0.55 ms, 固件处理 avg 2.0 us
+VCC_IN = 11.97 V, PC4 = 1.088 V
+通过 66/66，失败 0
+性能: 681.9 帧/s, RTT avg 2.62 ms, 固件处理 avg 2.1 us
 
 帧数                1000
-总耗时              214.5 ms
-吞吐                4661.0 帧/s
-TX 字节 / 占用      14000 B / 70.8%
-RX 字节 / 占用      16000 B / 80.9%
-RTT min/avg/max     0.47 / 0.55 / 0.82 ms
-固件处理时间        2 / 2.0 / 4 us
+总耗时              1466.4 ms
+吞吐                681.9 帧/s
+TX 字节 / 占用      14000 B / 82.9%
+RX 字节 / 占用      16000 B / 94.7%
+RTT min/avg/max     2.52 / 2.62 / 2.76 ms
+固件处理时间        2 / 2.1 / 18 us
 ```
 
 > `总耗时` 是从第一帧发出到最后一个响应到达；包含电脑 USB-TTL 驱动和
@@ -420,9 +486,12 @@ RTT min/avg/max     0.47 / 0.55 / 0.82 ms
 
 `.ioc` 当前配置：
 
-- USART1：Asynchronous，**PA9 = TX / PA10 = RX**，**921600** 8N1；
+- USART1：Asynchronous，**PA9 = TX / PA10 = RX**，**115200** 8N1；
 - USART1_RX：**DMA1_Stream1**，Circular，Byte，MemInc；
 - NVIC：USART1 全局中断、DMA1_Stream1 中断使能；
+- 外部电源检测：**PC4 = ADC1_INP4**，不在 `.ioc` 里，由
+  `App/Src/power_monitor.c` 直接初始化 ADC1；HAL ADC 驱动源码已复制到
+  `Drivers/STM32H7xx_HAL_Driver/` 并加进顶层 `CMakeLists.txt`；
 - `main.c` 的 `USER CODE BEGIN 2` 调用 `app_init()`，
   `USER CODE BEGIN 3` 调用 `app_poll()`。
 
@@ -436,18 +505,20 @@ RTT min/avg/max     0.47 / 0.55 / 0.82 ms
 3. `STM32H723xG_flash.ld` 是 CubeMX 生成的，**重新生成可能删掉
    `.dma_buffer` 段**；如果 DMA 完全收不到数据，先检查这个段还在不在，
    不在就把 5.3 节的链接片段加回去。
-4. 改波特率：改 `App/Inc/app_config.h` 的 `APP_UART_BAUD`，同时把
-   CubeMX 里 USART1 的 Baud Rate 改成同一个值（否则重新生成后 `usart.c`
-   会覆盖宏）。命令行临时改 115200：
-   `-DAPP_UART_BAUD=115200`。
-5. 如果只改 `.ioc` 不改代码，重新生成后也建议跑一遍
+4. 改波特率：在 CubeMX 里改 USART1 的 Baud Rate 并重新生成，`usart.c`
+   里是生成的 `huart1.Init.BaudRate = 115200;`。`app_config.h` 里的
+   `APP_UART_BAUD` 只作工程记录，不参与生成代码的波特率。
+5. 电源检测的 ADC 是手写在 `power_monitor.c` 里的；如果以后在 CubeMX 里
+   正式启用 ADC1，CubeMX 会生成 `Core/Src/adc.c` 和另一个
+   `HAL_ADC_MspInit`，需要删掉其中一份，避免重复定义。
+6. 如果只改 `.ioc` 不改代码，重新生成后也建议跑一遍
    `python tools/test_uart.py`，确认 `huart1`/DMA 流号没变。
 
 ---
 
 ## 9. 已知限制
 
-- 响应发送用阻塞 `HAL_UART_Transmit()`。单帧 16 B 在 921600 下 0.174 ms，
+- 响应发送用阻塞 `HAL_UART_Transmit()`。单帧 16 B 在 115200 下 1.39 ms，
   ring 完全吸收；但持续满速流的上限见 6.3。要更高吞吐可改 TX DMA + ring。
 - 没有应用层序列号/ACK；响应按请求顺序返回。粘包/丢帧时靠 NACK 和
   stats 定位。
@@ -462,17 +533,17 @@ RTT min/avg/max     0.47 / 0.55 / 0.82 ms
 
 | 现象 | 优先检查 |
 | --- | --- |
-| 完全收不到心跳 | 波特率、PA9/PA10 是否接反、GND、固件是否复位运行 |
+| 完全收不到心跳 | **外部电源（VCC_IN）是否上电**；只接 ST-Link SWD 不够；再查波特率、PA9/PA10 是否接反、GND |
 | 有心跳但 PING 无响应 | USB-TTL TX 是否真的接到 PA10；用 `tools/probe.py` 看原始字节 |
-| 偶发 CRC 错 | 线太长/杜邦线接触不良/电平 5V；先降到 115200 验证 |
-| 大量 TIMEOUT | 帧内字节间隔超过 20 ms（`APP_FRAME_TIMEOUT_MS`）；检查发送端是否分片太慢 |
+| 偶发 CRC 错 | 线太长/杜邦线接触不良/电平 5V；先检查接线和共地 |
+| 大量 TIMEOUT | 帧内字节间隔超过 50 ms（`APP_FRAME_TIMEOUT_MS`）；检查发送端是否分片太慢 |
 | `ring_drop_bytes` 增长 | 主机发送太快/太长突发；加大 ring 或加流控；见 6.3 |
 | DMA 完全没数据 | `.dma_buffer` 段是否还在 RAM_D2；DMA1_Stream1 是否使能 |
 
 快速探测：
 
 ```powershell
-python tools/probe.py --port COM12 --baud 921600 --seconds 3 --repeat 20
+python tools/probe.py --port COM12 --baud 115200 --seconds 3 --repeat 20
 ```
 
 ---
@@ -483,6 +554,7 @@ python tools/probe.py --port COM12 --baud 921600 --seconds 3 --repeat 20
 - USB-TTL：CH343（VID:PID = 1A86:55D3），COM12；
 - 固件：`Debug`，GCC 14.3.1（ST GNU Tools for STM32）；
 - 烧录：STM32CubeProgrammer 2.23.0，ST-Link V2；
+- 外部电源：VCC_IN ≈ 11.97 V（PC4 ≈ 1.088 V），`POWER_RSP present=1`；
 - 测试时间：2026-11-23。
 
 如果换板/换线，先跑 `tools/test_uart.py` 的 ping/calc，再跑 `--perf-count 1000`。

@@ -21,7 +21,7 @@ def frame(ftype: int, payload: bytes = b"") -> bytes:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default="COM12")
-    ap.add_argument("--baud", type=int, default=921600)
+    ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--seconds", type=float, default=0.8)
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--interval", type=float, default=0.1)

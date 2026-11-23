@@ -13,10 +13,10 @@
 /* UART                                                                       */
 /* -------------------------------------------------------------------------- */
 /* 硬件：USART1 = PA9(TX) / PA10(RX)，AF7，CH343 USB-TTL 接这里。
- * 板子原设计 USART1 跑 921600；如果你的 USB-TTL / CubeMX 是 115200，
- * 编译时加 -DAPP_UART_BAUD=115200 即可（见 README）。 */
+ * 当前 CubeMX 生成代码（Core/Src/usart.c）里是 115200。
+ * 改波特率请在 CubeMX 的 USART1 里改并重新生成；这里只作工程记录。 */
 #ifndef APP_UART_BAUD
-#define APP_UART_BAUD            921600U
+#define APP_UART_BAUD            115200U
 #endif
 #define APP_UART_INSTANCE        USART1
 
@@ -46,8 +46,10 @@
 #define APP_FRAME_MAX_PAYLOAD    8U
 #define APP_FRAME_MAX_SIZE       (APP_FRAME_MAX_PAYLOAD + 8U)
 
-/* 帧内字节间超时：超过该时间没有新字节，判定为残帧并回 NACK。 */
-#define APP_FRAME_TIMEOUT_MS     20U
+/* 帧内字节间超时：超过该时间没有新字节，判定为残帧并回 NACK。
+ * 115200 下一帧 16 B 约 1.39 ms；50 ms 给 USB-TTL/驱动留足突发间隔，
+ * 又能在人眼可感的时间内报出残帧。 */
+#define APP_FRAME_TIMEOUT_MS     50U
 
 /* -------------------------------------------------------------------------- */
 /* 版本                                                                       */

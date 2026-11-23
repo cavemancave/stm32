@@ -148,6 +148,20 @@ static uint8_t handle_stats(const frame_t *req, proto_msg_t *rsp, protocol_ctx_t
     return 0U;
 }
 
+static uint8_t handle_power(const frame_t *req, proto_msg_t *rsp, protocol_ctx_t *ctx)
+{
+    (void)req;
+    rsp->type = MSG_POWER_RSP;
+    rsp->len = APP_FRAME_MAX_PAYLOAD;
+    wr_u16le(&rsp->payload[0], ctx->vcc_mv);
+    wr_u16le(&rsp->payload[2], ctx->pin_mv);
+    rsp->payload[4] = ctx->power_present;
+    rsp->payload[5] = ctx->power_valid;
+    rsp->payload[6] = 0U;
+    rsp->payload[7] = 0U;
+    return 0U;
+}
+
 /* -------------------------------------------------------------------------- */
 /* 分发表                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -157,6 +171,7 @@ static const proto_desc_t s_descs[] = {
     { MSG_CALC_WEIGHTED_REQ, 6U, 6U, handle_weighted },
     { MSG_PING_REQ,          0U, 0U, handle_ping     },
     { MSG_STATS_REQ,         0U, 1U, handle_stats    },
+    { MSG_POWER_REQ,         0U, 0U, handle_power    },
 };
 
 static const proto_desc_t *find_desc(uint8_t type)
