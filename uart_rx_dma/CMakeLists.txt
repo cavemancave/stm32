@@ -66,6 +66,11 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
 )
 
+# Optional UART baud override, e.g. -DAPP_UART_BAUD=115200
+if(DEFINED APP_UART_BAUD)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE APP_UART_BAUD=${APP_UART_BAUD})
+endif()
+
 # Remove wrong libob.a library dependency when using cpp files
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 

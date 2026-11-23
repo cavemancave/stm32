@@ -44,11 +44,9 @@ MSG_STATS_RSP = 0x91
 # 异步 / 错误
 MSG_READY = 0x7E
 MSG_HEARTBEAT = 0x7D
-MSG_DEBUG = 0x7C
-MSG_DEBUG2 = 0x7B
 MSG_NACK = 0xEE
 
-ASYNC_TYPES = {MSG_READY, MSG_HEARTBEAT, MSG_DEBUG, MSG_DEBUG2}
+ASYNC_TYPES = {MSG_READY, MSG_HEARTBEAT}
 
 ERR_NAMES = {
     0: "NONE",
@@ -78,8 +76,6 @@ RSP_NAMES = {
     MSG_STATS_RSP: "STATS_RSP",
     MSG_READY: "READY",
     MSG_HEARTBEAT: "HEARTBEAT",
-    MSG_DEBUG: "DEBUG",
-    MSG_DEBUG2: "DEBUG2",
     MSG_NACK: "NACK",
 }
 
@@ -373,15 +369,6 @@ class Heartbeat:
 def decode_heartbeat(frame: Frame) -> Heartbeat:
     uptime, valid, errors = struct.unpack("<IHH", frame.payload)
     return Heartbeat(uptime, valid, errors)
-
-
-def decode_debug(frame: Frame) -> dict:
-    p = frame.payload
-    if frame.type == MSG_DEBUG:
-        ndtr, cr3 = struct.unpack_from("<HI", p, 2)
-        return {"pa9": p[0], "pa10": p[1], "ndtr": ndtr, "cr3": cr3}
-    dma_cr, m0ar = struct.unpack("<II", p)
-    return {"dma_cr": dma_cr, "m0ar": m0ar}
 
 
 def list_serial_ports() -> list[dict]:
