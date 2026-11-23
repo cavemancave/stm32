@@ -1,6 +1,6 @@
 # uart_rx_dma — USART1 RX/TX DMA + 环形缓冲 + 帧状态机 + 消息分发
 
-STM32H723VGT6（DM-MC-Board02）上的串口收发示例工程：
+STM32H723VGT6（DM-MC-Board02）上的串口收发示例工程。
 
 ```
 USART1 RX (PA10)
@@ -20,10 +20,6 @@ DMA 缓冲（RAM_D2，DMA 可访问）
    ├──► 响应 / NACK ──► TX FIFO 8192 B ──► DMA1_Stream0 ──► USART1 TX (PA9)
    └──► 统计 / 心跳
 ```
-
-最初需求写的是 UART7；按实际接线已改为 **USART1（PA9/PA10）**。
-协议层和 App 层与具体串口无关，换回 UART7 只需改 `Core/Src/usart.c`、`.ioc`
-和 `App/Src/app.c` 里的 `huart1`。
 
 ---
 
