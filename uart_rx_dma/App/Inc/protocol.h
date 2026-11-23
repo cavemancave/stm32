@@ -29,10 +29,6 @@ typedef struct {
     stats_t *stats;
     uint32_t boot_ms;
     uint32_t now_ms;
-    uint16_t vcc_mv;
-    uint16_t pin_mv;
-    uint8_t power_present;
-    uint8_t power_valid;
 } protocol_ctx_t;
 
 /* 把 type/payload 编成完整帧；返回帧长（8+len），参数非法返回 0。 */

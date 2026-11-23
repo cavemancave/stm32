@@ -34,8 +34,8 @@ DMA 缓冲（RAM_D2，DMA 可访问）
 | USB-TTL | CH343，Windows 上枚举为 **COM12** |
 | 调试器 | ST-Link V2，SWD（PA13/PA14） |
 | 固件 | `build/Debug/motor_control.elf` |
-| Python 测试 | **66/66 检查通过** |
-| 1000 帧压力测试 | **681.9 帧/s，TX 82.9%，RX 94.7%，RTT 2.62 ms，固件处理 ≈2 µs，0 丢帧/0 溢出** |
+| Python 测试 | **64/64 检查通过** |
+| 1000 帧压力测试 | **681.4 帧/s，TX 82.8%，RX 94.6%，RTT 2.61 ms，固件处理 ≈2 µs，0 丢帧/0 溢出** |
 
 > RTT 是电脑侧测的，包含 CH343/USB 驱动和 Python 线程调度；固件内部
 > 处理时间通常约 **2 µs**（DWT 周期计数器实测，偶发到十几 µs 是测量窗口里
@@ -54,9 +54,6 @@ DMA 缓冲（RAM_D2，DMA 可访问）
 | GND | 地 | GND（必须共地） |
 
 - 8N1、无硬件流控、3.3 V TTL。USB-TTL 的电平选择跳线请放 **3.3 V**。
-- **外部电源（VCC_IN）必须上电**：只接 ST-Link 的 SWD 时 MCU 可能能跑，
-  但 USART1/USB-TTL 不一定工作。固件用 **PC4/ADC1_INP4** 检测 VCC_IN，
-  测试脚本会主动提示；详见 4.5。
 - **TX/RX 必须交叉**：MCU 的 TX 接 USB-TTL 的 RX，MCU 的 RX 接 USB-TTL 的 TX。
   如果接成 TX-TX / RX-RX，表现是“电脑能收到板子的心跳，但板子收不到电脑的 PING”。
 - 如果收不到任何心跳，按顺序检查：波特率 → PA9/PA10 是否接反 → GND → 固件是否在跑。
@@ -147,14 +144,12 @@ A5 01 06 01 00 02 00 03 00 20 A2 20 80 5A
 | `CALC_WEIGHTED_REQ` | `0x03` | 电脑→板 | 同上 |
 | `PING_REQ` | `0x10` | 电脑→板 | 无 |
 | `STATS_REQ` | `0x11` | 电脑→板 | 1 B：page（0..4） |
-| `POWER_REQ` | `0x12` | 电脑→板 | 无 |
 | `CALC_SUM_RSP` | `0x81` | 板→电脑 | 8 B：`result int32, proc_us uint16, status uint8, reserved uint8` |
 | `CALC_SQSUM_RSP` | `0x82` | 板→电脑 | 同上 |
 | `CALC_WEIGHTED_RSP` | `0x83` | 板→电脑 | 同上 |
 | `PONG_RSP` | `0x90` | 板→电脑 | 8 B：`uptime_ms uint32, proc_us uint16, valid_frames uint16` |
 | `STATS_RSP` | `0x91` | 板→电脑 | 8 B：`page uint8, flags uint8, v0 uint16, v1 uint16, v2 uint16` |
-| `POWER_RSP` | `0x92` | 板→电脑 | 8 B：`vcc_mv uint16, pin_mv uint16, present uint8, valid uint8, reserved uint16` |
-| `HEARTBEAT` | `0x7D` | 板→电脑（1 Hz） | 8 B：`uptime_ms uint32, valid_frames uint16, flags uint16`（bit15=外部电源存在，低 15 位=uart_errors） |
+| `HEARTBEAT` | `0x7D` | 板→电脑（1 Hz） | 8 B：`uptime_ms uint32, valid_frames uint16, uart_errors uint16` |
 | `READY` | `0x7E` | 板→电脑（上电一次） | 8 B：`version uint16, max_payload uint8, dma_buf uint16, ring_size uint16, timeout_ms uint8` |
 | `NACK` | `0xEE` | 板→电脑 | 8 B：`err_code, type, len, state, raw[4]` |
 
@@ -200,37 +195,6 @@ NACK 的 `type/len` 是出错帧的类型/长度，`state` 是解析器出错时
 计数在固件里是 `uint32_t`，上报时饱和到 `uint16_t`，`flags bit0=1` 表示至少
 一个值饱和。
 
-### 4.5 外部电源检测（PC4 / ADC1_INP4）
-
-板子上的 VCC_IN 经 `R86 1 MΩ / R87 100 kΩ` 分压后接 **PC4 = ADC1_INP4**，
-分压比 11:1。固件用 ADC1 采样 PC4，换算：
-
-```
-VCC_IN = PC4_mV × 11
-```
-
-- `POWER_RSP.vcc_mv`：VCC_IN 电压（mV）；
-- `POWER_RSP.pin_mv`：PC4 引脚电压（mV），排查分压电阻/接线时看它；
-- `present`：`vcc_mv >= 5000` 时置 1，表示外部电源已上电（12 V / 6S 电池）；
-  断电时输入可能浮空到 2~3 V，用 5 V 门槛避免误判；
-- `valid`：ADC 校准/采样成功时为 1。
-
-实测外部 12 V 供电：`VCC_IN = 11.97 V, PC4 = 1.088 V`，`present = 1`。
-拔掉外部电源后实测 `VCC_IN ≈ 2.66 V, PC4 ≈ 0.242 V`，`present = 0`
-（输入浮空残留电压，低于 5 V 门槛）。
-
-> 只接 ST-Link 的 SWD 时，MCU 可能由调试器 3.3 V 供电并在跑，但板子的
-> VCC_IN（12 V / 电池）可能没上电，USART1/USB-TTL 不一定工作。测试脚本
-> 启动时会查一次 `POWER_RSP`，没上电就打印醒目提示；心跳的 `flags.bit15`
-> 也带外部电源状态；完全收不到心跳时也会把“外部电源”放在排查清单第一条。
->
-> **实测补充**：在“ST-Link 3.3 V 供 MCU + CH343 由 USB 自供电 + 共地”的
-> 接法下，断开 VCC_IN 后 USART1 仍能正常收发（PING 5/5、心跳正常），
-> 但电源检测仍会报 `present=0`。这不是所有接法都成立：如果 USB-TTL 的
-> VCC 接在板子 3.3 V/5 V 上，或 USART 线上有由 VCC_IN 供电的电平转换/
-> 隔离，就会没反应。另外 ST-Link 的 3.3 V 电流有限，电机/IMU/WS2812 等
-> 外设都没电，不能当正常供电用。
-
 ---
 
 ## 5. 软件结构
@@ -243,7 +207,6 @@ App/
     crc32.h                   CRC-32/ISO-HDLC
     frame_parser.h            帧结构、错误码、解析器状态
     messages.h                消息类型编号
-    power_monitor.h           外部电源检测（PC4/ADC1_INP4）
     protocol.h                编解码/分发接口
     ringbuf.h                 SPSC 环形缓冲
     stats.h                   统计计数
@@ -253,7 +216,6 @@ App/
     app.c                     初始化、主循环、回包、错误上报
     crc32.c                   CRC 实现
     frame_parser.c            状态机
-    power_monitor.c           ADC1_INP4 采样 + VCC_IN 换算
     protocol.c                帧编码、消息分发表、响应/NACK
     ringbuf.c                 SPSC 环形缓冲
     stats.c                   统计页构造
@@ -280,8 +242,7 @@ tools/
 5. 状态机通过 `on_frame` 回调把完整帧交给 `protocol_handle()`。
 6. `protocol_handle()` 查表分发，构造响应或 NACK；`app.c` 用
    `HAL_UART_Transmit()` 发回。
-7. 每 1 s 发一条 `HEARTBEAT`；`power_monitor_poll()` 每 1 s 采一次 VCC_IN；
-   错误/溢出还会主动发 NACK。
+7. 每 1 s 发一条 `HEARTBEAT`；错误/溢出还会主动发 NACK。
 
 ### 5.2 为什么用 IDLE，而不是只用半满/全满中断
 
@@ -457,11 +418,10 @@ DMA 一直挂着接收请求，正常不会 ORE。若发生 ORE/FE/NE/PE：
 
 ## 7. Python 测试覆盖
 
-`tools/test_uart.py` 的 66 项检查：
+`tools/test_uart.py` 的 64 项检查：
 
 | # | 场景 | 内容 |
 | --- | --- | --- |
-| 0 | 外部电源 | `POWER_REQ`/`POWER_RSP`，检查 ADC 有效、`VCC_IN >= 5 V` |
 | 1 | 正常 PING | 5 次 PING/PONG，检查 uptime、proc_us、RTT |
 | 2 | 三个计算消息 | 8 组输入（正/负/零/大数饱和），校验结果和 status |
 | 3 | 粘包 | 4 帧一次写、前导垃圾 + 3 帧、单帧拆两次写 |
@@ -474,17 +434,16 @@ DMA 一直挂着接收请求，正常不会 ORE。若发生 ORE/FE/NE/PE：
 实测输出（节选）：
 
 ```
-VCC_IN = 11.97 V, PC4 = 1.088 V
-通过 66/66，失败 0
-性能: 681.9 帧/s, RTT avg 2.62 ms, 固件处理 avg 2.1 us
+通过 64/64，失败 0
+性能: 681.4 帧/s, RTT avg 2.61 ms, 固件处理 avg 2.0 us
 
 帧数                1000
-总耗时              1466.4 ms
-吞吐                681.9 帧/s
-TX 字节 / 占用      14000 B / 82.9%
-RX 字节 / 占用      16000 B / 94.7%
-RTT min/avg/max     2.52 / 2.62 / 2.76 ms
-固件处理时间        2 / 2.1 / 18 us
+总耗时              1467.6 ms
+吞吐                681.4 帧/s
+TX 字节 / 占用      14000 B / 82.8%
+RX 字节 / 占用      16000 B / 94.6%
+RTT min/avg/max     2.52 / 2.61 / 2.78 ms
+固件处理时间        2 / 2.0 / 4 us
 ```
 
 > `总耗时` 是从第一帧发出到最后一个响应到达；包含电脑 USB-TTL 驱动和
@@ -499,9 +458,6 @@ RTT min/avg/max     2.52 / 2.62 / 2.76 ms
 - USART1：Asynchronous，**PA9 = TX / PA10 = RX**，**115200** 8N1；
 - USART1_RX：**DMA1_Stream1**，Circular，Byte，MemInc；
 - NVIC：USART1 全局中断、DMA1_Stream1 中断使能；
-- 外部电源检测：**PC4 = ADC1_INP4**，不在 `.ioc` 里，由
-  `App/Src/power_monitor.c` 直接初始化 ADC1；HAL ADC 驱动源码已复制到
-  `Drivers/STM32H7xx_HAL_Driver/` 并加进顶层 `CMakeLists.txt`；
 - `main.c` 的 `USER CODE BEGIN 2` 调用 `app_init()`，
   `USER CODE BEGIN 3` 调用 `app_poll()`。
 
@@ -518,10 +474,7 @@ RTT min/avg/max     2.52 / 2.62 / 2.76 ms
 4. 改波特率：在 CubeMX 里改 USART1 的 Baud Rate 并重新生成，`usart.c`
    里是生成的 `huart1.Init.BaudRate = 115200;`。`app_config.h` 里的
    `APP_UART_BAUD` 只作工程记录，不参与生成代码的波特率。
-5. 电源检测的 ADC 是手写在 `power_monitor.c` 里的；如果以后在 CubeMX 里
-   正式启用 ADC1，CubeMX 会生成 `Core/Src/adc.c` 和另一个
-   `HAL_ADC_MspInit`，需要删掉其中一份，避免重复定义。
-6. 如果只改 `.ioc` 不改代码，重新生成后也建议跑一遍
+5. 如果只改 `.ioc` 不改代码，重新生成后也建议跑一遍
    `python tools/test_uart.py`，确认 `huart1`/DMA 流号没变。
 
 ---
@@ -543,7 +496,7 @@ RTT min/avg/max     2.52 / 2.62 / 2.76 ms
 
 | 现象 | 优先检查 |
 | --- | --- |
-| 完全收不到心跳 | **外部电源（VCC_IN）是否上电**；只接 ST-Link SWD 不够；再查波特率、PA9/PA10 是否接反、GND |
+| 完全收不到心跳 | 波特率、PA9/PA10 是否接反、GND、固件是否复位运行 |
 | 有心跳但 PING 无响应 | USB-TTL TX 是否真的接到 PA10；用 `tools/probe.py` 看原始字节 |
 | 偶发 CRC 错 | 线太长/杜邦线接触不良/电平 5V；先检查接线和共地 |
 | 大量 TIMEOUT | 帧内字节间隔超过 50 ms（`APP_FRAME_TIMEOUT_MS`）；检查发送端是否分片太慢 |
@@ -564,7 +517,6 @@ python tools/probe.py --port COM12 --baud 115200 --seconds 3 --repeat 20
 - USB-TTL：CH343（VID:PID = 1A86:55D3），COM12；
 - 固件：`Debug`，GCC 14.3.1（ST GNU Tools for STM32）；
 - 烧录：STM32CubeProgrammer 2.23.0，ST-Link V2；
-- 外部电源：VCC_IN ≈ 11.97 V（PC4 ≈ 1.088 V），`POWER_RSP present=1`；
 - 测试时间：2026-11-23。
 
 如果换板/换线，先跑 `tools/test_uart.py` 的 ping/calc，再跑 `--perf-count 1000`。

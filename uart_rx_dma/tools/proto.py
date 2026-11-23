@@ -33,7 +33,6 @@ MSG_CALC_SQSUM_REQ = 0x02
 MSG_CALC_WEIGHTED_REQ = 0x03
 MSG_PING_REQ = 0x10
 MSG_STATS_REQ = 0x11
-MSG_POWER_REQ = 0x12
 
 # 响应
 MSG_CALC_SUM_RSP = 0x81
@@ -41,7 +40,6 @@ MSG_CALC_SQSUM_RSP = 0x82
 MSG_CALC_WEIGHTED_RSP = 0x83
 MSG_PONG_RSP = 0x90
 MSG_STATS_RSP = 0x91
-MSG_POWER_RSP = 0x92
 
 # 异步 / 错误
 MSG_READY = 0x7E
@@ -76,7 +74,6 @@ RSP_NAMES = {
     MSG_CALC_WEIGHTED_RSP: "CALC_WEIGHTED_RSP",
     MSG_PONG_RSP: "PONG_RSP",
     MSG_STATS_RSP: "STATS_RSP",
-    MSG_POWER_RSP: "POWER_RSP",
     MSG_READY: "READY",
     MSG_HEARTBEAT: "HEARTBEAT",
     MSG_NACK: "NACK",
@@ -367,25 +364,11 @@ class Heartbeat:
     uptime_ms: int
     valid_frames: int
     uart_errors: int
-    power_present: int
 
 
 def decode_heartbeat(frame: Frame) -> Heartbeat:
-    uptime, valid, flags = struct.unpack("<IHH", frame.payload)
-    return Heartbeat(uptime, valid, flags & 0x7FFF, 1 if (flags & 0x8000) else 0)
-
-
-@dataclass
-class PowerStatus:
-    vcc_mv: int
-    pin_mv: int
-    present: int
-    valid: int
-
-
-def decode_power(frame: Frame) -> PowerStatus:
-    vcc, pin, present, valid, _reserved = struct.unpack("<HHBBH", frame.payload)
-    return PowerStatus(vcc, pin, present, valid)
+    uptime, valid, errors = struct.unpack("<IHH", frame.payload)
+    return Heartbeat(uptime, valid, errors)
 
 
 def list_serial_ports() -> list[dict]:

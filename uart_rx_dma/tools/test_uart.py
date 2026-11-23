@@ -32,8 +32,6 @@ from proto import (
     MSG_NACK,
     MSG_PING_REQ,
     MSG_PONG_RSP,
-    MSG_POWER_REQ,
-    MSG_POWER_RSP,
     MSG_STATS_REQ,
     MSG_STATS_RSP,
     Nack,
@@ -45,7 +43,6 @@ from proto import (
     decode_heartbeat,
     decode_nack,
     decode_pong,
-    decode_power,
     decode_stats,
     encode,
     list_serial_ports,
@@ -95,27 +92,6 @@ def expect_nack(link: SerialLink, code: int, timeout: float = 1.0) -> Optional[N
 # --------------------------------------------------------------------------- #
 # 测试项
 # --------------------------------------------------------------------------- #
-def test_power(link: SerialLink) -> None:
-    section("0. 外部电源检查（PC4 / ADC1_INP4，VCC_IN 分压 11:1）")
-    link.drain()
-    link.send(MSG_POWER_REQ)
-    frame = link.wait_frame({MSG_POWER_RSP}, 1.0)
-    if frame is None:
-        check(False, "电源检测有响应")
-        print("         !! 没有收到 POWER_RSP；检查固件是否包含 power_monitor.c")
-        return
-    p = decode_power(frame)
-    check(p.valid != 0, "ADC 读数有效")
-    if p.valid:
-        print(f"         VCC_IN = {p.vcc_mv / 1000:.2f} V, PC4 = {p.pin_mv / 1000:.3f} V")
-    check(p.present != 0, f"外部电源已上电（VCC_IN={p.vcc_mv / 1000:.2f} V）")
-    if not p.present:
-        print()
-        print("         ！！ 外部电源未上电（或 VCC_IN 低于 5 V）")
-        print("         只接 ST-Link 的 SWD 时，USART1/USB-TTL 可能没有工作。")
-        print("         请给板子 VCC_IN 上电（12 V 电源 / 电池），再按复位重新测试。")
-
-
 def test_ping(link: SerialLink) -> None:
     section("1. 正常功能：PING / PONG")
     link.drain()
@@ -522,7 +498,7 @@ def main() -> int:
     parser.add_argument("--baud", type=int, default=921600)
     parser.add_argument("--list", action="store_true", help="列出串口")
     parser.add_argument("--tests", default="all",
-                        help="逗号分隔: power,ping,calc,sticky,interrupt,crc,bad,stats,perf,all")
+                        help="逗号分隔: ping,calc,sticky,interrupt,crc,bad,stats,perf,all")
     parser.add_argument("--perf-count", type=int, default=500)
     parser.add_argument("--json", default=os.path.join(os.path.dirname(__file__), "test_report.json"))
     args = parser.parse_args()
@@ -547,34 +523,23 @@ def main() -> int:
         hb = link.wait_frame({MSG_HEARTBEAT}, 2.5, skip_async=False)
         if hb is None:
             print()
-            print("！！ 没收到心跳。优先检查外部电源：")
-            print("   - 只接 ST-Link 的 SWD 时，MCU 可能能跑，但 USART1/USB-TTL 不一定工作。")
-            print("   - 请给板子 VCC_IN 上电（12 V 电源 / 电池），再按复位。")
-            print("其他检查：")
+            print("！！ 没收到心跳。请检查：")
             print("   - 固件波特率和 --baud 是否一致（当前 CubeMX 生成 115200）")
             print("   - USB-TTL 的 TX 是否接 PA10、RX 是否接 PA9、GND 是否共地")
             print("   - 板子是否已复位运行")
             print("尝试发 PING...")
             link.send(MSG_PING_REQ)
             if link.wait_frame({MSG_PONG_RSP}, 1.0) is None:
-                print("PING 也无响应，退出。请先确认外部电源已上电。")
+                print("PING 也无响应，退出。")
                 return 2
         else:
             h = decode_heartbeat(hb)
-            print(f"心跳: uptime={h.uptime_ms}ms valid={h.valid_frames} "
-                  f"uart_err={h.uart_errors} 外部电源={'有' if h.power_present else '无'}")
-            if not h.power_present:
-                print()
-                print("！！ 心跳里报告外部电源未上电（VCC_IN < 5 V 或 ADC 无效）。")
-                print("   只接 ST-Link 的 SWD 时 USART1/USB-TTL 可能不稳定；")
-                print("   请给板子 VCC_IN 上电（12 V 电源 / 电池）后再测试。")
+            print(f"心跳: uptime={h.uptime_ms}ms valid={h.valid_frames} uart_err={h.uart_errors}")
 
         tests = args.tests.strip().lower()
         run_all = tests == "all"
         selected = {t.strip() for t in tests.split(",")} if not run_all else set()
 
-        if run_all or "power" in selected:
-            test_power(link)
         if run_all or "ping" in selected:
             test_ping(link)
         if run_all or "calc" in selected:

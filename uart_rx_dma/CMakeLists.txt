@@ -48,15 +48,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/app.c
     App/Src/crc32.c
     App/Src/frame_parser.c
-    App/Src/power_monitor.c
     App/Src/protocol.c
     App/Src/ringbuf.c
     App/Src/stats.c
     App/Src/timebase.c
     App/Src/uart_dma_rx.c
-    # HAL ADC driver for PC4/VCC_IN power detection
-    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_adc.c
-    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_adc_ex.c
 )
 
 # Add include paths
@@ -68,7 +64,6 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
-    HAL_ADC_MODULE_ENABLED
 )
 
 # Remove wrong libob.a library dependency when using cpp files

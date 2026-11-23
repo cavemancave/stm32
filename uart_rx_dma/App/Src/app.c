@@ -12,7 +12,6 @@
 #include "timebase.h"
 #include "bytes.h"
 #include "messages.h"
-#include "power_monitor.h"
 #include "usart.h"
 #include "main.h"
 #include <string.h>
@@ -57,10 +56,6 @@ static void app_on_frame(const frame_t *frame, void *ctx)
     pctx.stats = &s_stats;
     pctx.boot_ms = s_boot_ms;
     pctx.now_ms = HAL_GetTick();
-    pctx.vcc_mv = power_monitor_vcc_mv();
-    pctx.pin_mv = power_monitor_pin_mv();
-    pctx.power_present = power_monitor_present() ? 1U : 0U;
-    pctx.power_valid = power_monitor_valid() ? 1U : 0U;
 
     proto_msg_t rsp;
     memset(&rsp, 0, sizeof(rsp));
@@ -146,15 +141,11 @@ static void app_send_ready(void)
 static void app_send_heartbeat(uint32_t now_ms)
 {
     proto_msg_t msg;
-    uint16_t flags = sat_u16(uart_dma_rx_error_count());
-    if (power_monitor_present()) {
-        flags |= 0x8000U; /* bit15 = 外部电源存在；低 15 位 = uart 错误数 */
-    }
     msg.type = MSG_HEARTBEAT;
     msg.len = APP_FRAME_MAX_PAYLOAD;
     wr_u32le(&msg.payload[0], (uint32_t)(now_ms - s_boot_ms));
     wr_u16le(&msg.payload[4], sat_u16(s_stats.valid_frames));
-    wr_u16le(&msg.payload[6], flags);
+    wr_u16le(&msg.payload[6], sat_u16(uart_dma_rx_error_count()));
     (void)app_send_msg(&msg);
 }
 
@@ -177,8 +168,6 @@ void app_init(void)
     s_last_uart_report_ms = 0U;
     s_last_heartbeat_ms = HAL_GetTick();
 
-    power_monitor_init();
-
     if (!uart_dma_rx_start(&huart1, &s_ring)) {
         Error_Handler();
     }
@@ -200,7 +189,6 @@ void app_poll(void)
     frame_parser_tick(&s_parser, HAL_GetTick());
 
     now_ms = HAL_GetTick();
-    power_monitor_poll(now_ms);
     app_report_ring_overflow(now_ms);
     app_report_uart_error(now_ms);
 
