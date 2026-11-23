@@ -211,10 +211,13 @@ VCC_IN = PC4_mV × 11
 
 - `POWER_RSP.vcc_mv`：VCC_IN 电压（mV）；
 - `POWER_RSP.pin_mv`：PC4 引脚电压（mV），排查分压电阻/接线时看它；
-- `present`：`vcc_mv >= 3000` 时置 1，表示外部电源已上电；
+- `present`：`vcc_mv >= 5000` 时置 1，表示外部电源已上电（12 V / 6S 电池）；
+  断电时输入可能浮空到 2~3 V，用 5 V 门槛避免误判；
 - `valid`：ADC 校准/采样成功时为 1。
 
 实测外部 12 V 供电：`VCC_IN = 11.97 V, PC4 = 1.088 V`，`present = 1`。
+拔掉外部电源后实测 `VCC_IN ≈ 2.66 V, PC4 ≈ 0.242 V`，`present = 0`
+（输入浮空残留电压，低于 5 V 门槛）。
 
 > 只接 ST-Link 的 SWD 时，MCU 可能由调试器 3.3 V 供电并在跑，但板子的
 > VCC_IN（12 V / 电池）可能没上电，USART1/USB-TTL 不一定工作。测试脚本
@@ -451,7 +454,7 @@ DMA 一直挂着接收请求，正常不会 ORE。若发生 ORE/FE/NE/PE：
 
 | # | 场景 | 内容 |
 | --- | --- | --- |
-| 0 | 外部电源 | `POWER_REQ`/`POWER_RSP`，检查 ADC 有效、`VCC_IN >= 3 V` |
+| 0 | 外部电源 | `POWER_REQ`/`POWER_RSP`，检查 ADC 有效、`VCC_IN >= 5 V` |
 | 1 | 正常 PING | 5 次 PING/PONG，检查 uptime、proc_us、RTT |
 | 2 | 三个计算消息 | 8 组输入（正/负/零/大数饱和），校验结果和 status |
 | 3 | 粘包 | 4 帧一次写、前导垃圾 + 3 帧、单帧拆两次写 |

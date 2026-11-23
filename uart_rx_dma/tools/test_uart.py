@@ -111,7 +111,7 @@ def test_power(link: SerialLink) -> None:
     check(p.present != 0, f"外部电源已上电（VCC_IN={p.vcc_mv / 1000:.2f} V）")
     if not p.present:
         print()
-        print("         ！！ 外部电源未上电（或 VCC_IN 低于 3 V）")
+        print("         ！！ 外部电源未上电（或 VCC_IN 低于 5 V）")
         print("         只接 ST-Link 的 SWD 时，USART1/USB-TTL 可能没有工作。")
         print("         请给板子 VCC_IN 上电（12 V 电源 / 电池），再按复位重新测试。")
 
@@ -565,7 +565,7 @@ def main() -> int:
                   f"uart_err={h.uart_errors} 外部电源={'有' if h.power_present else '无'}")
             if not h.power_present:
                 print()
-                print("！！ 心跳里报告外部电源未上电（VCC_IN < 3 V 或 ADC 无效）。")
+                print("！！ 心跳里报告外部电源未上电（VCC_IN < 5 V 或 ADC 无效）。")
                 print("   只接 ST-Link 的 SWD 时 USART1/USB-TTL 可能不稳定；")
                 print("   请给板子 VCC_IN 上电（12 V 电源 / 电池）后再测试。")
 

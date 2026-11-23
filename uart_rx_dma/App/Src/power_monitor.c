@@ -24,7 +24,7 @@
 #define PM_VREF_MV          3300U
 #define PM_SAMPLES          8U
 #define PM_ADC_TIMEOUT_MS   10U
-#define PM_PRESENT_MV       3000U   /* VCC_IN >= 3 V 认为外部电源存在 */
+#define PM_PRESENT_MV       5000U   /* VCC_IN >= 5 V 认为外部电源存在（12V/6S） */
 #define PM_PERIOD_MS        1000U
 
 static ADC_HandleTypeDef s_hadc1;
