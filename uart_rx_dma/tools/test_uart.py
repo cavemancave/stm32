@@ -292,6 +292,13 @@ def test_bad_frames(link: SerialLink) -> None:
     nack = expect_nack(link, 5, 1.0)
     check(nack is not None, "未知类型收到 NACK_UNKNOWN_TYPE")
 
+    # 最大帧：LEN=8，整帧 16 字节；未知类型也应被完整解析（不越界）
+    link.send(0x55, bytes(range(8)))
+    nack = expect_nack(link, 5, 1.0)
+    check(nack is not None, "LEN=8 最大 16 字节帧被正确解析")
+    link.send(MSG_PING_REQ)
+    check(link.wait_frame({MSG_PONG_RSP}, 1.0) is not None, "最大帧后恢复")
+
     # payload 长度不符（calc 要求 6 字节）
     link.send(MSG_CALC_SUM_REQ, b"\x01\x00\x02\x00\x03")
     nack = expect_nack(link, 6, 1.0)
@@ -530,23 +537,22 @@ def main() -> int:
         run_all = tests == "all"
         selected = {t.strip() for t in tests.split(",")} if not run_all else set()
 
-        if hb is not None or True:
-            if run_all or "ping" in selected:
-                test_ping(link)
-            if run_all or "calc" in selected:
-                test_calc(link)
-            if run_all or "sticky" in selected:
-                test_sticky(link)
-            if run_all or "interrupt" in selected:
-                test_interrupt(link)
-            if run_all or "crc" in selected:
-                test_crc(link)
-            if run_all or "bad" in selected:
-                test_bad_frames(link)
-            if run_all or "stats" in selected:
-                test_stats(link)
-            if run_all or "perf" in selected:
-                perf = test_perf(link, args.perf_count, args.baud)
+        if run_all or "ping" in selected:
+            test_ping(link)
+        if run_all or "calc" in selected:
+            test_calc(link)
+        if run_all or "sticky" in selected:
+            test_sticky(link)
+        if run_all or "interrupt" in selected:
+            test_interrupt(link)
+        if run_all or "crc" in selected:
+            test_crc(link)
+        if run_all or "bad" in selected:
+            test_bad_frames(link)
+        if run_all or "stats" in selected:
+            test_stats(link)
+        if run_all or "perf" in selected:
+            perf = test_perf(link, args.perf_count, args.baud)
 
     finally:
         link.close()
